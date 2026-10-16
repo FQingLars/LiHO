@@ -13,8 +13,7 @@ system output ─▶ loopback ───────┘        (one model instanc
                                    tagged transcript
                               «Интервьюер: …» / «Пользователь: …»
                                                  │
-                                       question heuristic
-                                       (interviewer only)
+                              pacing gate (≥30 chars, ≥3 s)
                                                  ▼
                              DeepSeek web chat ──▶ answer on screen
 ```
@@ -41,9 +40,12 @@ system output ─▶ loopback ───────┘        (one model instanc
 
 The two audio sources are tagged in the transcript: the microphone is
 «Пользователь» (the candidate), the system output is «Интервьюер» (the call).
-Only the interviewer's words can trigger an answer; the candidate's speech is
-context for it. If the loopback cannot start, LIhO logs a warning and keeps
-running on the microphone alone.
+Only the interviewer's words are forwarded, always together with the dialogue
+history — deciding whether that was a question is the model's job. Pacing (a
+minimum of new text and a minimum gap) keeps a monologue from turning into a
+burst of requests, and the inbox keeps only the newest message so a busy worker
+never answers a stale question. If the loopback cannot start, LIhO logs a
+warning and keeps running on the microphone alone.
 
 ## Build
 
@@ -99,6 +101,10 @@ logprob splitter to the numbers produced by the original Python code;
 ## Notes
 
 * T-one is Russian-only and telephony-oriented.
+* There is no question detector: T-one's alphabet has no punctuation at all, so
+  "does it end with `?`" could never fire. Everything the interviewer says is
+  sent instead, and the system prompt tells the model what to answer and what
+  to do with small talk.
 * Use headphones: with speakers, the microphone hears the interviewer too and
   both streams transcribe the same words. There is no echo cancellation.
 * The greedy decoder is used instead of the upstream KenLM beam search

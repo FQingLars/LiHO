@@ -1,7 +1,7 @@
 # LIhO — AGENTS.md
 
 ## Project state
-- Rust project (edition 2024). **End-to-end with parallel answering**, cross-platform and two-sided: mic capture («Пользователь») + system-output loopback («Интервьюер») → **T-one streaming ASR**, one model instance per stream → tagged transcript → question heuristic on the interviewer's words only → answer worker (DeepSeek web, PoW+SSE, single chat) → answer on screen. Linux shows a Wayland overlay, Windows/macOS print to stdout.
+- Rust project (edition 2024). **End-to-end with parallel answering**, cross-platform and two-sided: mic capture («Пользователь») + system-output loopback («Интервьюер») → **T-one streaming ASR**, one model instance per stream → tagged transcript → pacing gate → answer worker (DeepSeek web, PoW+SSE, single chat) → answer on screen. Linux shows a Wayland overlay, Windows/macOS print to stdout.
 - Entry point: `src/main.rs`. Build with `cargo build`, run with `cargo run` and speak; Ctrl-C (or SIGTERM on Unix) stops it.
 - CLI flags: `--geometry WxH+X+Y` (size + right/top margins), `--font-size N` (8..72), `--autohide-ms N` (hide overlay N ms after each answer — Linux only). Unknown args ignored; parsing lives in `display::OverlayGeometry::from_args` with unit tests.
 
@@ -24,8 +24,7 @@
 |---|---|
 | `audio/` | `mod.rs`: `Source` (User/Interviewer) + labels, resampler, `CaptureHandle` with a backend-specific stop action. `mic.rs`: cpal default input. `loopback_linux.rs`: PipeWire sink monitor. `loopback_windows.rs`: WASAPI loopback. Bounded channel, drop (never block) on overflow |
 | `tone/` | T-one streaming ASR: `mod.rs` ONNX inference, `splitter.rs` logprob→phrases, `decoder.rs` greedy CTC |
-| `pipeline.rs` | listener thread (audio→phrases→fire policy→queue) + answer worker thread |
-| `question.rs` | heuristic "is this a finished interview question?" |
+| `pipeline.rs` | listener thread (audio→phrases→tagged transcript→pacing gate) + answer worker thread, `RequestGate`, latest-wins `Inbox` |
 | `llm.rs` + `pow.rs` | DeepSeek web chat client, PoW gate (vendored site wasm), warm-header pool |
 | `display/` | `mod.rs` geometry + backend selection, `wayland.rs` (Linux), `console.rs` (Windows/macOS) |
 | `config.rs` | `.env` + env vars |
@@ -39,11 +38,11 @@
 - Capture config ranking: i16 > f32, then fewest channels, then rate closest to 16 kHz (T-one needs 8 kHz; PipeWire `default` may offer 384 kHz × 32 ch — 48× the resampling work for nothing).
 - Loopback per OS: Linux = PipeWire monitor (`STREAM_CAPTURE_SINK=true`, F32LE, PipeWire main loop on the backend thread); Windows = WASAPI — client from the **Render** endpoint, then `initialize_client(..., Direction::Capture, ...)` is what sets `AUDCLNT_STREAMFLAGS_LOOPBACK`, and data is read with `AudioCaptureClient::read_from_device_to_deque`. Note `initialize_mta()` returns `HRESULT`, not `Result`.
 - Loopback failure is not fatal: warn and run on the microphone alone.
-- Only the interviewer stream can fire the LLM. Every phrase is appended to the tagged transcript; a question fires immediately, an open question fires at most one follow-up, and the message sent is the whole bounded transcript (so the model sees «Пользователь:» context too).
+- **No question detector** — it was deleted. T-one's alphabet is 33 Cyrillic letters + space, so a `text.ends_with('?')` rule can never fire and a starter-word rule gated on `.`/`!`/`…` was dead too; both were removed rather than patched. Everything the interviewer says is forwarded now, and whether it was a question is the model's call (see `LIHO_SYSTEM_PROMPT`). Only pacing stays local: `RequestGate` (≥30 new interviewer chars AND ≥3 s since the last request) and `Inbox` (latest-wins, so a busy worker never answers a stale question).
+- DeepSeek SSE protocol (captured live, tests pinned to it): an answer can span **two** content paths — `response/content` for the first characters and `response/fragments/<i>/content` (index may be `-1`) for the rest. The opening `update_session` blob's `fragments[]` is a **partial snapshot** (live: "Кон" of a 150-word answer) and must never truncate the stream; it is a fallback for one-word replies that arrive complete inside the blob. `message_id` still comes from that blob.
 - DeepSeek web API (`chat.deepseek.com/api/v0/*`) with browser `userToken` from localStorage; `DEEPSEEK_TOKEN` env or `.env`, never logged.
 - Completion requires a PoW header (`POST /api/v0/chat/create_pow_challenge`, solved by vendored `assets/pow_solver.wasm` via wasmi, ~20-30 s). Prefetch: `DeepSeekWeb::schedule_refill()` keeps a warm 300 s header so an answer only streams (~1 s).
-- LLM tokens expire → 401/403 are fatal; 40300 `MISSING_HEADER` is flaky and retried up to 3×.
-- SSE is JSON-patch (`{"p":"response/content","o":"APPEND","v":"текст"}`), finish is `response/status = FINISHED`; `message_id` from `update_session` must be passed as `parent_message_id`.
+- LLM tokens expire → 401/403 are fatal; 40300 `MISSING_HEADER` is flaky and retried up to 3× (it arrives as the whole SSE body, so it must be handled before the stream parser).
 - Display backends are cfg-gated in `display/mod.rs`; Wayland deps live in `[target.'cfg(target_os = "linux")'.dependencies]`. Overlay protocol: no buffer attach before the first configure+ack, else the connection dies.
 - OBS-undetectable on Linux: Hyprland layer rule `hl.layer_rule{ match={namespace="^LIhO$"}, no_screen_share=true }` keeps the overlay out of share frames; `--autohide-ms` shrinks the exposure window further. There is no Windows equivalent — the console backend prints only when an answer arrives.
 

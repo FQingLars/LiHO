@@ -84,14 +84,32 @@ fn preview(s: &str) -> String {
 /// - `data:` lines carry JSON patches;
 /// - `{"p":"<path>","o":"<op>","v":<val>}` — path persists until changed,
 ///   so continuations may omit `p`/`o` and carry only `v`;
-/// - answer text lives under path `response/content`;
+/// - long answers stream under path `response/content`;
+/// - the final `update_session` blob always carries the complete answer in
+///   `v.response.fragments[]` — for short replies (and for the tail of a long
+///   one) it is the *only* place the text appears, so it is authoritative;
 /// - stream ends when `response/status` receives `"FINISHED"`;
-/// - `update_session` carries a full-state blob whose
-///   `v.response.message_id` is needed for threading the next turn.
+/// - the same blob's `v.response.message_id` is needed for threading the next
+///   turn.
+/// Is this SSE path a response-content path?
+///
+/// Captured live: `response/content` (older shape) and
+/// `response/fragments/<index>/content`, the index being possibly negative.
+fn is_content_path(path: &str) -> bool {
+    if path == "response/content" {
+        return true;
+    }
+    path.strip_prefix("response/fragments/")
+        .and_then(|rest| rest.strip_suffix("/content"))
+        .is_some_and(|index| index.parse::<i32>().is_ok())
+}
+
 #[derive(Default)]
 pub(crate) struct SseAccumulator {
     buf: Vec<u8>,
     text: String,
+    /// Text of the last non-empty RESPONSE fragment of the session blob.
+    snapshot: Option<String>,
     finished: bool,
     last_message_id: Option<i64>,
     current_path: Option<String>,
@@ -110,8 +128,13 @@ impl SseAccumulator {
         self.process_buffer()
     }
 
+    /// The answer: streamed text, or the session blob when nothing streamed.
     pub(crate) fn text(&self) -> &str {
-        &self.text
+        if self.text.is_empty() {
+            self.snapshot.as_deref().unwrap_or(&self.text)
+        } else {
+            &self.text
+        }
     }
 
     pub(crate) fn message_id(&self) -> Option<i64> {
@@ -145,13 +168,30 @@ impl SseAccumulator {
         if let Some(p) = v.get("p").and_then(Value::as_str) {
             self.current_path = Some(p.to_string());
         }
-        // Full-state blob from `update_session`.
+        // Full-state blob from `update_session`: the authoritative answer plus
+        // the id needed to thread the next turn.
         if let Some(mid) = v.pointer("/v/response/message_id").and_then(Value::as_i64) {
             self.last_message_id = Some(mid);
         }
+        if let Some(fragments) = v.pointer("/v/response/fragments").and_then(Value::as_array) {
+            // A snapshot, not the answer: kept only as a fallback.
+            let latest = fragments
+                .iter()
+                .filter(|f| {
+                    f.get("type").and_then(Value::as_str) == Some("RESPONSE")
+                        && f.get("content")
+                            .and_then(Value::as_str)
+                            .is_some_and(|c| !c.is_empty())
+                })
+                .filter_map(|f| f.get("content").and_then(Value::as_str))
+                .next_back();
+            if let Some(content) = latest {
+                self.snapshot = Some(content.to_string());
+            }
+        }
 
-        match self.current_path.as_deref() {
-            Some("response/content") => {
+        match self.current_path.as_deref().map(is_content_path) {
+            Some(true) => {
                 if let Some(s) = v.get("v").and_then(Value::as_str) {
                     match v.get("o").and_then(Value::as_str) {
                         Some("SET") => self.text.clear(),
@@ -162,7 +202,7 @@ impl SseAccumulator {
                     }
                 }
             }
-            Some("response/status") => {
+            Some(false) if self.current_path.as_deref() == Some("response/status") => {
                 if v.get("v").and_then(Value::as_str) == Some("FINISHED") {
                     debug!("SSE: stream finished");
                     self.finished = true;
@@ -594,6 +634,59 @@ mod tests {
         assert_eq!(acc.text(), "Четыре");
         assert_eq!(acc.message_id(), Some(2));
         assert!(acc.is_finished());
+    }
+
+    /// Captured live: the whole answer arrives in the `update_session` blob's
+    /// `v.response.fragments`, and no `response/content` event is ever sent for
+    /// short replies.
+    #[test]
+    fn sse_answer_from_update_session_fragment() {
+        let mut acc = SseAccumulator::new();
+        let stream = concat!(
+            "event: ready\n\n",
+            "event: update_session\n",
+            "data: {\"v\":{\"response\":{\"fragments\":[{\"content\":\"4\",\"id\":2,",
+            "\"references\":[],\"stage_id\":1,\"type\":\"RESPONSE\"}],\"message_id\":2,",
+            "\"role\":\"ASSISTANT\",\"status\":\"WIP\"}}}\n\n",
+            "data: {\"p\":\"response\",\"o\":\"BATCH\",\"v\":[{\"p\":\"accumulated_token_usage\",\"v\":50}]}\n\n",
+            "data: {\"p\":\"response/status\",\"o\":\"SET\",\"v\":\"FINISHED\"}\n\n"
+        );
+        assert!(acc.feed(stream.as_bytes()).unwrap());
+        assert_eq!(acc.text(), "4", "answer lives in the session blob");
+        assert_eq!(acc.message_id(), Some(2));
+    }
+
+    /// Captured live, long answer: the text starts under `response/content`
+    /// and continues under `response/fragments/-1/content`, while the opening
+    /// session blob only holds the first characters. Both content paths must
+    /// be concatenated in arrival order, and the blob must never truncate it.
+    #[test]
+    fn sse_answer_spans_both_content_paths_and_ignores_partial_snapshot() {
+        let mut acc = SseAccumulator::new();
+        let stream = concat!(
+            "event: ready\n\n",
+            "event: update_session\n",
+            "data: {\"v\":{\"response\":{\"fragments\":[{\"content\":\"Кон\",\"id\":2,",
+            "\"references\":[],\"stage_id\":1,\"type\":\"RESPONSE\"}],\"message_id\":2}}}\n\n",
+            "data: {\"p\":\"response/content\",\"o\":\"APPEND\",\"v\":\"Кон\"}\n\n",
+            "data: {\"p\":\"response/fragments/-1/content\",\"o\":\"APPEND\",\"v\":\"вей\"}\n\n",
+            "data: {\"v\":\"ер\"}\n\n",
+            "data: {\"v\":\" обработ\"}\n\n",
+            "data: {\"p\":\"response/status\",\"o\":\"SET\",\"v\":\"FINISHED\"}\n\n"
+        );
+        assert!(acc.feed(stream.as_bytes()).unwrap());
+        assert_eq!(acc.text(), "Конвейер обработ", "snapshot must not truncate");
+        assert_eq!(acc.message_id(), Some(2));
+    }
+
+    #[test]
+    fn content_paths_are_recognised() {
+        assert!(is_content_path("response/content"));
+        assert!(is_content_path("response/fragments/-1/content"));
+        assert!(is_content_path("response/fragments/0/content"));
+        assert!(!is_content_path("response/status"));
+        assert!(!is_content_path("response/accumulated_token_usage"));
+        assert!(!is_content_path("response/fragments"));
     }
 
     #[test]

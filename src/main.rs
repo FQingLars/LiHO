@@ -11,7 +11,6 @@ mod display;
 mod llm;
 mod pipeline;
 mod pow;
-mod question;
 mod tone;
 
 #[tokio::main]

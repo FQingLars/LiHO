@@ -13,9 +13,13 @@
 //! Интервьюер: а с какими версиями?
 //! ```
 //!
-//! Only the interviewer stream can trigger an answer
-//! ([crate::question::is_question]); the candidate's own words are context for
-//! it. Answering starts while the interviewer is still talking.
+//! Everything the interviewer says is forwarded to the LLM together with the
+//! dialogue history — deciding *whether* it was a question is the model's job,
+//! not a fragile text heuristic's (T-one emits no punctuation at all, so "does
+//! it end with '?'" can never fire). What remains on this side of the wire is
+//! pacing: a minimum amount of new interviewer text and a minimum gap between
+//! requests, so one monologue is one stream of requests instead of one per
+//! breath.
 //!
 //! **Answer worker**: consumes the queue strictly in order (one DeepSeek chat
 //! session must be threaded sequentially), drives the LLM through a dedicated
@@ -23,9 +27,8 @@
 //!
 //! `stop` flips an atomic that ends both loops promptly.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use log::{debug, error, info, warn};
@@ -34,88 +37,113 @@ use crate::audio::{CaptureHandle, Source};
 use crate::config::Config;
 use crate::display::OverlayCtl;
 use crate::llm::DeepSeekWeb;
-use crate::question::is_question;
 use crate::tone::{CHUNK_SAMPLES, Transcriber};
 
-/// Minimum NEW characters before accumulated text may (re-)fire the LLM.
-const MIN_NEW_CHARS: usize = 12;
-/// Upper bound for the interviewer's accumulated text; older speech is cut.
-const MAX_BUFFER_CHARS: usize = 2_000;
+/// Upper bound for the interviewer's accumulated speech; older text is cut so
+/// a long monologue cannot grow without bound.
+const MAX_INTERVIEWER_CHARS: usize = 2_000;
 /// Upper bound for the whole tagged transcript sent to the LLM.
 const MAX_TRANSCRIPT_CHARS: usize = 2_000;
+/// Minimum NEW interviewer characters before another request is sent.
+/// ~3 s of Russian speech at ~10 characters/s.
+const MIN_NEW_CHARS: usize = 30;
+/// Minimum wall-clock gap between two requests. The worker answers strictly in
+/// order and a round-trip takes ~1-3 s; without this a fast talker would build
+/// a backlog of stale questions.
+const MIN_REQUEST_GAP: Duration = Duration::from_secs(3);
 
-/// Decides when the running transcript should trigger an answer.
+/// Decides when the interviewer's speech is worth sending.
 ///
-/// T-one only emits a phrase after ~600 ms of silence, so every phrase is a
-/// natural pause: that is the "the speaker stopped here" signal. Firing rules:
-///
-/// * the accumulated text (or the fresh phrase alone) looks like a question —
-///   answer it, even mid-sentence, and mark the question as open;
-/// * the interviewer keeps talking about an open question — fire once more so
-///   the answer sees the rest of what was said;
-/// * anything else — stay quiet.
-///
-/// Returns the transcript offset to mark as answered *after* the message built
-/// from it is really queued (a failed send must not consume the text).
-#[derive(Debug, Default)]
-pub struct FirePolicy {
-    answered_chars: usize,
-    question_open: bool,
-    followup_fired: bool,
+/// Pure pacing, no semantics: enough new text since the last request **and**
+/// enough time passed. `now` is injected so the rule stays testable.
+pub struct RequestGate {
+    min_new_chars: usize,
+    min_gap: Duration,
+    sent_at: Option<Instant>,
 }
 
-impl FirePolicy {
+impl RequestGate {
+    pub fn new(min_new_chars: usize, min_gap: Duration) -> Self {
+        Self {
+            min_new_chars,
+            min_gap,
+            sent_at: None,
+        }
+    }
+
+    /// Is `new_chars` (interviewer characters accumulated since the last
+    /// request) enough to ask again at `now`?
+    pub fn allows(&self, new_chars: usize, now: Instant) -> bool {
+        if new_chars < self.min_new_chars {
+            return false;
+        }
+        match self.sent_at {
+            None => true,
+            Some(at) => now.duration_since(at) >= self.min_gap,
+        }
+    }
+
+    /// Remember that a request went out at `now`.
+    pub fn record_sent(&mut self, now: Instant) {
+        self.sent_at = Some(now);
+    }
+}
+
+impl Default for RequestGate {
+    fn default() -> Self {
+        Self::new(MIN_NEW_CHARS, MIN_REQUEST_GAP)
+    }
+}
+
+/// Latest-wins inbox between the listener and the answer worker.
+///
+/// While the worker is busy with one request, a newer transcript **replaces**
+/// the queued one: the model always answers the freshest dialogue, and a burst
+/// of interviewer speech collapses into a single request instead of a backlog.
+pub struct Inbox {
+    slot: Mutex<Option<String>>,
+    filled: Condvar,
+}
+
+impl Inbox {
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Text length already sent to the LLM.
-    pub fn answered_chars(&self) -> usize {
-        self.answered_chars
-    }
-
-    /// Re-base the offset after the text buffer was trimmed.
-    pub fn set_answered_chars(&mut self, answered_chars: usize) {
-        self.answered_chars = answered_chars;
-    }
-
-    /// Decide whether the freshly finalized `phrase` triggers an answer.
-    ///
-    /// `buffer` is the interviewer's accumulated text, `phrase` the new text.
-    pub fn on_phrase(&mut self, buffer: &str, phrase: &str) -> Option<usize> {
-        let n = buffer.chars().count();
-        if n < self.answered_chars + MIN_NEW_CHARS {
-            return None;
+        Self {
+            slot: Mutex::new(None),
+            filled: Condvar::new(),
         }
-        if is_question(buffer) || is_question(phrase) {
-            self.question_open = true;
-            self.followup_fired = false;
-            return Some(n);
-        }
-        if self.question_open && !self.followup_fired {
-            self.followup_fired = true;
-            return Some(n);
-        }
-        None
     }
 
-    /// Call once the message built from that offset reached the queue.
-    pub fn mark_sent(&mut self, answered_chars: usize) {
-        self.answered_chars = answered_chars;
+    /// Queue a message, superseding any not-yet-taken one.
+    pub fn put(&self, message: String) {
+        let mut slot = self.slot.lock().expect("inbox poisoned");
+        *slot = Some(message);
+        self.filled.notify_all();
+    }
+
+    /// Take the queued message, waiting up to `timeout` for one to arrive.
+    pub fn take_timeout(&self, timeout: Duration) -> Option<String> {
+        let slot = self.slot.lock().expect("inbox poisoned");
+        let (mut slot, _) = self
+            .filled
+            .wait_timeout_while(slot, timeout, |queued| queued.is_none())
+            .expect("inbox poisoned");
+        slot.take()
     }
 }
 
-/// The tagged transcript plus the fire policy — everything the listener needs
-/// to decide *what* to send.
+impl Default for Inbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The tagged transcript plus the pacing gate — everything the listener needs
+/// to decide *what and when* to send.
 pub struct ListenState {
     transcript: String,
     interviewer: String,
-    policy: FirePolicy,
     system_prompt: String,
     system_sent: bool,
-    /// Offset decided by the last `on_phrase`, confirmed by `mark_sent`
-    /// once the message reached the queue.
-    pending_answered: usize,
 }
 
 impl ListenState {
@@ -123,21 +151,24 @@ impl ListenState {
         Self {
             transcript: String::new(),
             interviewer: String::new(),
-            policy: FirePolicy::new(),
             system_prompt: system_prompt.to_string(),
             system_sent: false,
-            pending_answered: 0,
         }
     }
 
-    /// Feed one finalized phrase. Returns the message to queue, if any.
+    /// Length of the interviewer's accumulated speech so far.
+    pub fn interviewer_chars(&self) -> usize {
+        self.interviewer.chars().count()
+    }
+
+    /// Feed one finalized phrase into the tagged transcript.
     ///
-    /// Every phrase is appended to the transcript; only the interviewer's
-    /// phrases can trigger an answer.
-    pub fn on_phrase(&mut self, source: Source, phrase: &str) -> Option<String> {
+    /// Returns nothing: *whether* to send is decided by the caller through
+    /// [`Self::message`] plus the [`RequestGate`].
+    pub fn on_phrase(&mut self, source: Source, phrase: &str) {
         let phrase = phrase.trim();
         if phrase.is_empty() {
-            return None;
+            return;
         }
         self.transcript.push_str(source.label());
         self.transcript.push_str(": ");
@@ -145,34 +176,32 @@ impl ListenState {
         self.transcript.push('\n');
         self.trim_transcript();
 
-        if source != Source::Interviewer {
-            return None;
-        }
-
-        self.interviewer.push_str(phrase);
-        self.interviewer.push(' ');
-        let (trimmed, survived) = trim_buffer(&self.interviewer, self.policy.answered_chars());
-        self.interviewer = trimmed;
-        self.policy.set_answered_chars(survived);
-
-        let answered = self.policy.on_phrase(&self.interviewer, phrase)?;
-        self.pending_answered = answered;
-        if self.system_sent {
-            Some(self.transcript.clone())
-        } else {
-            self.system_sent = true;
-            Some(format!(
-                "{}\n\nДиалог (реплики помечены спикером):\n{}",
-                self.system_prompt,
-                self.transcript.trim_end()
-            ))
+        if source == Source::Interviewer {
+            self.interviewer.push_str(phrase);
+            self.interviewer.push(' ');
+            if self.interviewer.chars().count() > MAX_INTERVIEWER_CHARS {
+                self.interviewer = self
+                    .interviewer
+                    .chars()
+                    .skip(MAX_INTERVIEWER_CHARS / 2)
+                    .collect();
+            }
         }
     }
 
-    /// Confirm that the message from the last `on_phrase` was queued.
-    pub fn mark_sent(&mut self) {
-        let answered = self.pending_answered;
-        self.policy.mark_sent(answered);
+    /// The message to send: the whole tagged dialogue, with the role prompt
+    /// attached to the first request of the session.
+    pub fn message(&mut self) -> String {
+        if self.system_sent {
+            self.transcript.clone()
+        } else {
+            self.system_sent = true;
+            format!(
+                "{}\n\nДиалог (реплики помечены спикером, новые идут в конце):\n{}",
+                self.system_prompt,
+                self.transcript.trim_end()
+            )
+        }
     }
 
     /// Keep the transcript bounded, dropping whole lines only.
@@ -188,21 +217,6 @@ impl ListenState {
             None => rest,
         };
     }
-}
-
-/// Keep the interviewer's text bounded: cut off the oldest text, but never
-/// before what the LLM has already been given (that would re-answer old
-/// speech). Returns the new text plus how many chars of the answered prefix
-/// survived.
-pub fn trim_buffer(text: &str, answered_chars: usize) -> (String, usize) {
-    let total = text.chars().count();
-    if total <= MAX_BUFFER_CHARS {
-        return (text.to_string(), answered_chars);
-    }
-    let cut = total - MAX_BUFFER_CHARS;
-    let at = cut.max(answered_chars.min(total));
-    let kept: String = text.chars().skip(at).collect();
-    (kept, answered_chars.saturating_sub(at))
 }
 
 /// One conversation side: its capture, its T-one state and its buffer.
@@ -229,12 +243,13 @@ impl Pipeline {
         overlay: OverlayCtl,
         stop: Arc<AtomicBool>,
     ) -> std::thread::JoinHandle<()> {
-        let (q_tx, q_rx) = mpsc::channel::<String>();
+        let inbox = Arc::new(Inbox::new());
 
         let worker_stop = Arc::clone(&stop);
         let llm_worker = Arc::clone(&llm);
         let overlay_worker = overlay.clone();
         let session_for_worker = session_id.clone();
+        let worker_inbox = Arc::clone(&inbox);
         let worker = std::thread::Builder::new()
             .name("liho-answerer".into())
             .spawn(move || {
@@ -243,14 +258,14 @@ impl Pipeline {
                     llm_worker,
                     session_for_worker,
                     overlay_worker,
-                    q_rx,
+                    worker_inbox,
                 )
             })
             .expect("spawn answerer");
 
         let listener = std::thread::Builder::new()
             .name("liho-listener".into())
-            .spawn(move || listen(cfg, streams, overlay, q_tx, stop))
+            .spawn(move || listen(cfg, streams, overlay, inbox, stop))
             .expect("spawn listener");
 
         LISTENER_WORKER.lock().unwrap().replace(worker);
@@ -273,7 +288,7 @@ fn listen(
     cfg: Config,
     streams: Vec<(CaptureHandle, Transcriber)>,
     overlay: OverlayCtl,
-    q_tx: mpsc::Sender<String>,
+    inbox: Arc<Inbox>,
     stop: Arc<AtomicBool>,
 ) {
     let mut streams: Vec<Stream> = streams
@@ -287,6 +302,8 @@ fn listen(
         .collect();
     let labels: Vec<&str> = streams.iter().map(|s| s.source.label()).collect();
     let mut state = ListenState::new(&cfg.system_prompt);
+    let mut gate = RequestGate::default();
+    let mut sent_chars = 0usize;
     let mut chunks_seen = 0u64;
     let mut stats_at = Instant::now();
 
@@ -323,15 +340,19 @@ fn listen(
                         continue;
                     }
                     info!("STT {}: “{}”", stream.source.label(), p.text.trim());
-                    if let Some(message) = state.on_phrase(stream.source, &p.text) {
-                        info!("fire: “{}”", message.lines().last().unwrap_or("").trim());
-                        overlay.set_text("Понял вопрос, отвечаю…");
-                        if send_raw(&q_tx, message) {
-                            state.mark_sent();
-                        }
-                    }
+                    state.on_phrase(stream.source, &p.text);
                 }
             }
+        }
+
+        // ---- pacing: forward the interviewer's speech to the LLM ----
+        let now = Instant::now();
+        let heard = state.interviewer_chars();
+        if gate.allows(heard.saturating_sub(sent_chars), now) {
+            gate.record_sent(now);
+            sent_chars = heard;
+            overlay.set_text("Формирую ответ…");
+            inbox.put(state.message());
         }
 
         if !got_audio {
@@ -360,22 +381,12 @@ fn listen(
     info!("listener stopped");
 }
 
-fn send_raw(q_tx: &mpsc::Sender<String>, msg: String) -> bool {
-    match q_tx.send(msg) {
-        Ok(()) => true,
-        Err(e) => {
-            error!("answer queue closed: {e}");
-            false
-        }
-    }
-}
-
 fn answer_worker(
     stop: Arc<AtomicBool>,
     llm: Arc<DeepSeekWeb>,
     session_id: String,
     overlay: OverlayCtl,
-    q_rx: mpsc::Receiver<String>,
+    inbox: Arc<Inbox>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -394,7 +405,9 @@ fn answer_worker(
             // Drain nothing on shutdown; exit promptly.
             break;
         }
-        let Ok(message) = q_rx.recv_timeout(Duration::from_millis(150)) else {
+        // Latest-wins: while we were busy a fresher transcript may have
+        // replaced this one in the inbox.
+        let Some(message) = inbox.take_timeout(Duration::from_millis(150)) else {
             continue;
         };
         overlay.set_text("Думаю над ответом…");
@@ -431,187 +444,69 @@ mod tests {
 
     const PROMPT: &str = "Ты — ассистент на интервью.";
 
-    /// Feed phrases from one source and collect the messages that fired.
-    fn run(sources: &[(Source, &str)]) -> Vec<String> {
-        let mut st = ListenState::new(PROMPT);
-        let mut out = Vec::new();
-        for (source, phrase) in sources {
-            if let Some(msg) = st.on_phrase(*source, phrase) {
-                st.mark_sent();
-                out.push(msg);
-            }
-        }
-        out
+    fn state() -> ListenState {
+        ListenState::new(PROMPT)
     }
 
-    fn transcript_of(sources: &[(Source, &str)]) -> String {
-        let mut st = ListenState::new(PROMPT);
-        for (source, phrase) in sources {
-            st.on_phrase(*source, phrase);
-        }
-        st.transcript
-    }
-
-    // ---- fire policy -------------------------------------------------
-
-    fn policy_after(chunks: &[&str]) -> (FirePolicy, Vec<usize>) {
-        let mut p = FirePolicy::new();
-        let mut buffer = String::new();
-        let mut fires = Vec::new();
-        for phrase in chunks {
-            buffer.push_str(phrase);
-            if let Some(answered) = p.on_phrase(&buffer, phrase) {
-                p.mark_sent(answered);
-                fires.push(answered);
-            }
-        }
-        (p, fires)
-    }
-
-    #[test]
-    fn plain_statement_does_not_fire() {
-        let (p, f) = policy_after(&["я расскажу про свой опыт работы "]);
-        assert!(f.is_empty());
-        assert_eq!(p.answered_chars(), 0);
-    }
-
-    #[test]
-    fn question_with_enough_new_chars_fires() {
-        let (_, f) = policy_after(&["вы работали с kafka в продакшене? "]);
-        assert_eq!(f.len(), 1);
-        assert_eq!(f[0], "вы работали с kafka в продакшене? ".chars().count());
-    }
-
-    #[test]
-    fn too_few_new_chars_does_not_refire() {
-        let mut p = FirePolicy::new();
-        p.set_answered_chars("вы работали с kafka?".chars().count());
-        assert!(p.on_phrase("вы работали с kafka? да", " да").is_none());
-    }
-
-    #[test]
-    fn short_text_never_fires() {
-        let mut p = FirePolicy::new();
-        assert!(p.on_phrase("да?", "да?").is_none());
-    }
-
-    #[test]
-    fn continuation_of_open_question_fires_once() {
-        let (_, f) = policy_after(&[
-            "какие у вас были обязанности? ",
-            "я руководил командой из пяти человек и отвечал за найм ",
-            "а ещё мы запускали еженедельные релизы ",
-        ]);
-        assert_eq!(f.len(), 2, "question + exactly one followup: {f:?}");
-    }
-
-    #[test]
-    fn followup_after_new_question_fires_again() {
-        let (_, f) = policy_after(&[
-            "вы работали с kafka в продакшене? ",
-            "а с какими версиями брокеров? ",
-        ]);
-        assert_eq!(f.len(), 2);
-    }
-
-    #[test]
-    fn monologue_after_question_stays_quiet() {
-        let (_, f) = policy_after(&[
-            "какие у вас были обязанности? ",
-            "спасибо, очень подробно ",
-            "кстати, в следующем раунде спросят про деплой ",
-        ]);
-        assert_eq!(f.len(), 2, "only the followup: {f:?}");
-    }
-
-    // ---- speaker tagging ---------------------------------------------
+    // ---- transcript --------------------------------------------------
 
     #[test]
     fn every_phrase_is_tagged_with_its_speaker() {
-        let t = transcript_of(&[
-            (Source::Interviewer, "какой у вас опыт"),
-            (Source::User, "я три года работал с kafka"),
-        ]);
-        assert!(t.contains("Интервьюер: какой у вас опыт\n"), "{t}");
-        assert!(
-            t.contains("Пользователь: я три года работал с kafka\n"),
-            "{t}"
+        let mut st = state();
+        st.on_phrase(Source::Interviewer, "какой у вас опыт");
+        st.on_phrase(Source::User, "я три года работал с kafka");
+        assert_eq!(
+            st.transcript,
+            "Интервьюер: какой у вас опыт\nПользователь: я три года работал с kafka\n"
         );
-    }
-
-    #[test]
-    fn candidate_speech_alone_never_fires() {
-        let out = run(&[
-            (Source::User, "вы работали с kafka в продакшене давно"),
-            (Source::User, "а с какими версиями брокеров?"),
-        ]);
-        assert!(
-            out.is_empty(),
-            "candidate must not trigger answers: {out:?}"
-        );
-    }
-
-    #[test]
-    fn interviewer_question_carries_candidate_context() {
-        let out = run(&[
-            (Source::User, "я три года работал с kafka в продакшене"),
-            (Source::Interviewer, "а с какими версиями брокеров?"),
-        ]);
-        assert_eq!(out.len(), 1, "{out:?}");
-        let msg = &out[0];
-        assert!(msg.contains("Пользователь: я три года работал"), "{msg}");
-        assert!(msg.contains("Интервьюер: а с какими версиями"), "{msg}");
-    }
-
-    #[test]
-    fn system_prompt_goes_out_only_once() {
-        let out = run(&[
-            (
-                Source::Interviewer,
-                "какой у вас опыт с kafka в продакшене?",
-            ),
-            (
-                Source::Interviewer,
-                "а с какими версиями брокеров вы работали?",
-            ),
-        ]);
-        assert_eq!(out.len(), 2);
-        assert!(out[0].starts_with(PROMPT), "{:?}", out[0]);
-        assert!(!out[1].contains(PROMPT), "prompt repeated: {:?}", out[1]);
-    }
-
-    #[test]
-    fn first_message_explains_the_tags() {
-        let out = run(&[(Source::Interviewer, "какой у вас опыт с kafka?")]);
-        assert!(out[0].contains("Диалог"), "{:?}", out[0]);
-    }
-
-    #[test]
-    fn failed_send_retries_the_same_question() {
-        let mut st = ListenState::new(PROMPT);
-        let q = "вы работали с kafka в продакшене?";
-        assert!(st.on_phrase(Source::Interviewer, q).is_some());
-        // No mark_sent: the message was lost, the question must fire again.
-        assert!(st.on_phrase(Source::Interviewer, q).is_some());
     }
 
     #[test]
     fn empty_and_blank_phrases_are_ignored() {
-        let mut st = ListenState::new(PROMPT);
-        assert!(st.on_phrase(Source::Interviewer, "").is_none());
-        assert!(st.on_phrase(Source::Interviewer, "   ").is_none());
+        let mut st = state();
+        st.on_phrase(Source::Interviewer, "");
+        st.on_phrase(Source::Interviewer, "   ");
+        st.on_phrase(Source::User, "\n");
         assert!(st.transcript.is_empty());
     }
 
-    // ---- bounds -------------------------------------------------------
+    #[test]
+    fn candidate_speech_is_never_counted_as_new_interviewer_text() {
+        let mut st = state();
+        st.on_phrase(Source::User, "я три года работал с kafka в продакшене");
+        assert_eq!(st.interviewer_chars(), 0);
+    }
+
+    #[test]
+    fn message_carries_the_whole_dialogue_with_the_prompt_once() {
+        let mut st = state();
+        st.on_phrase(Source::Interviewer, "какой у вас опыт с kafka");
+        st.on_phrase(Source::User, "я три года работал с ним");
+        let first = st.message();
+        assert!(first.starts_with(PROMPT), "{first}");
+        assert!(first.contains("Диалог"), "{first}");
+        assert!(
+            first.contains("Интервьюер: какой у вас опыт с kafka"),
+            "{first}"
+        );
+        assert!(
+            first.contains("Пользователь: я три года работал с ним"),
+            "{first}"
+        );
+
+        st.on_phrase(Source::Interviewer, "а с какими версиями");
+        let second = st.message();
+        assert!(!second.contains(PROMPT), "prompt sent twice: {second}");
+        assert!(second.contains("а с какими версиями"), "{second}");
+    }
 
     #[test]
     fn transcript_is_bounded_and_line_aligned() {
-        let mut st = ListenState::new(PROMPT);
+        let mut st = state();
         for _ in 0..200 {
             st.on_phrase(
                 Source::Interviewer,
-                "разговор про распределённые системы и очереди",
+                "разговор про распределённые системы и очереди сообщений",
             );
         }
         assert!(
@@ -621,46 +516,96 @@ mod tests {
         );
         assert!(
             st.transcript.starts_with("Интервьюер:"),
-            "{:?}",
-            &st.transcript[..40]
+            "trimmed mid-line: {:?}",
+            &st.transcript[..40.min(st.transcript.len())]
         );
     }
 
     #[test]
     fn interviewer_buffer_is_bounded() {
-        let mut st = ListenState::new(PROMPT);
+        let mut st = state();
         for _ in 0..200 {
-            st.on_phrase(
-                Source::Interviewer,
-                "очень длинная реплика без вопроса вообще",
-            );
+            st.on_phrase(Source::Interviewer, "очень длинная реплика про архитектуру");
         }
-        assert!(st.interviewer.chars().count() <= MAX_BUFFER_CHARS);
+        assert!(st.interviewer_chars() <= MAX_INTERVIEWER_CHARS);
+    }
+
+    // ---- request pacing ----------------------------------------------
+
+    #[test]
+    fn first_request_goes_out_immediately() {
+        let gate = RequestGate::default();
+        assert!(gate.allows(MIN_NEW_CHARS, Instant::now()));
     }
 
     #[test]
-    fn trim_buffer_keeps_short_text_untouched() {
-        let (t, a) = trim_buffer("короткий вопрос?", 0);
-        assert_eq!(t, "короткий вопрос?");
-        assert_eq!(a, 0);
+    fn too_little_new_text_does_not_send() {
+        let gate = RequestGate::default();
+        assert!(!gate.allows(MIN_NEW_CHARS - 1, Instant::now()));
+        assert!(!gate.allows(0, Instant::now()));
     }
 
     #[test]
-    fn trim_buffer_drops_old_text_and_rebases_answered_offset() {
-        let text = "а ".repeat(MAX_BUFFER_CHARS * 2);
-        let (t, a) = trim_buffer(&text, 0);
-        assert_eq!(t.chars().count(), MAX_BUFFER_CHARS);
-        assert_eq!(a, 0);
-        assert!(t.starts_with("а а а"), "oldest text goes first");
+    fn gap_between_requests_is_respected() {
+        let t0 = Instant::now();
+        let mut gate = RequestGate::default();
+        gate.record_sent(t0);
+        let too_soon = t0 + MIN_REQUEST_GAP - Duration::from_millis(50);
+        assert!(!gate.allows(999, too_soon), "sent too soon");
+        let late_enough = t0 + MIN_REQUEST_GAP + Duration::from_millis(10);
+        assert!(gate.allows(999, late_enough), "gap elapsed");
     }
 
     #[test]
-    fn trim_buffer_does_not_re_introduce_already_answered_text() {
-        let tail = "новый вопрос про kafka?";
-        let text = format!("{}{}", "старое ".repeat(MAX_BUFFER_CHARS), tail);
-        let answered = MAX_BUFFER_CHARS * 7;
-        let (t, a) = trim_buffer(&text, answered);
-        assert_eq!(a, 0, "answered prefix is gone, offset must reset");
-        assert!(t.ends_with(tail), "newest text kept: {t:?}");
+    fn both_conditions_must_hold() {
+        let t0 = Instant::now();
+        let mut gate = RequestGate::default();
+        gate.record_sent(t0);
+        // Enough time, not enough text.
+        assert!(!gate.allows(3, t0 + MIN_REQUEST_GAP * 2));
+        // Enough text, not enough time.
+        assert!(!gate.allows(MIN_NEW_CHARS * 10, t0));
+    }
+
+    // ---- inbox -------------------------------------------------------
+
+    const NOW: Duration = Duration::from_millis(0);
+
+    #[test]
+    fn inbox_hands_the_message_over() {
+        let inbox = Inbox::new();
+        assert_eq!(inbox.take_timeout(NOW), None, "empty inbox");
+        inbox.put("первое".into());
+        assert_eq!(inbox.take_timeout(NOW).as_deref(), Some("первое"));
+        assert_eq!(inbox.take_timeout(NOW), None, "taken exactly once");
+    }
+
+    #[test]
+    fn inbox_keeps_only_the_newest_message() {
+        let inbox = Inbox::new();
+        inbox.put("устаревшее".into());
+        inbox.put("свежее".into());
+        assert_eq!(inbox.take_timeout(NOW).as_deref(), Some("свежее"));
+    }
+
+    #[test]
+    fn inbox_waits_for_a_message_and_wakes_on_put() {
+        use std::sync::Arc;
+        let inbox = Arc::new(Inbox::new());
+        let waiter = Arc::clone(&inbox);
+        let handle = std::thread::spawn(move || waiter.take_timeout(Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(50));
+        inbox.put("будильник".into());
+        assert_eq!(handle.join().unwrap().as_deref(), Some("будильник"));
+    }
+
+    #[test]
+    fn inbox_timeout_returns_none_when_idle() {
+        let inbox = Inbox::new();
+        assert_eq!(
+            inbox.take_timeout(Duration::from_millis(20)),
+            None,
+            "must not block forever"
+        );
     }
 }
