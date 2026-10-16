@@ -20,7 +20,8 @@ pub const BLANK: usize = 34;
 pub fn greedy_decode(logprobs: &[f32]) -> String {
     let mut out = String::new();
     let mut prev: Option<usize> = None;
-    for frame in logprobs.chunks_exact(NUM_LABELS) {
+    let (frames, _) = logprobs.as_chunks::<NUM_LABELS>();
+    for frame in frames.iter() {
         let mut best = 0usize;
         let mut best_v = f32::NEG_INFINITY;
         for (i, v) in frame.iter().enumerate() {

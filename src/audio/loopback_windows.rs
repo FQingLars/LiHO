@@ -12,7 +12,6 @@
 //! the audio engine.
 
 use std::collections::VecDeque;
-use std::convert::TryInto;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -132,10 +131,8 @@ fn run_loopback(
 
         if queue.len() >= blockalign {
             let bytes: Vec<u8> = queue.drain(..).collect();
-            let samples: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().expect("4-byte f32 chunk")))
-                .collect();
+            let (floats, _) = bytes.as_chunks::<4>();
+            let samples: Vec<f32> = floats.iter().map(|b| f32::from_le_bytes(*b)).collect();
             let usable = samples.len() - samples.len() % LOOPBACK_CHANNELS as usize;
             let mono = downmix_to_mono(&samples[..usable], LOOPBACK_CHANNELS as usize);
             let out = converter.convert(&mono, LOOPBACK_RATE, TARGET_RATE);
