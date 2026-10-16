@@ -8,7 +8,6 @@
 //! Caveat: with speakers in the room the monitor also hears the microphone.
 //! Headphones avoid the duplication; there is no echo cancellation here.
 
-use std::convert::TryInto;
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -153,10 +152,8 @@ fn run_loopback(
             let channels = st.format.channels().max(1) as usize;
             let src_rate = st.format.rate().max(1);
 
-            let floats: Vec<f32> = bytes
-                .chunks_exact(mem::size_of::<f32>())
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                .collect();
+            let (chunks, _) = bytes.as_chunks::<{ mem::size_of::<f32>() }>();
+            let floats: Vec<f32> = chunks.iter().map(|b| f32::from_le_bytes(*b)).collect();
             let mono = downmix_to_mono(&floats, channels);
             let out = st.converter.convert(&mono, src_rate, TARGET_RATE);
             drop(st);

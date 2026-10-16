@@ -526,7 +526,9 @@ mod tests {
     }
 
     fn bright_pixel_count(rgba: &[u8]) -> usize {
-        rgba.chunks_exact(4)
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[2] > 170 && p[3] > 60)
             .count()
     }
@@ -536,7 +538,12 @@ mod tests {
         let rgba = render("");
         assert_eq!(rgba.len(), (OVERLAY_W * OVERLAY_H * 4) as usize);
         // Background alpha ~178 everywhere except AA edges.
-        let opaque = rgba.chunks_exact(4).filter(|p| p[3] > 100).count();
+        let opaque = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[3] > 100)
+            .count();
         assert!(opaque > (OVERLAY_W * OVERLAY_H) as usize * 9 / 10);
         assert_eq!(bright_pixel_count(&rgba), 0, "no text expected");
     }
@@ -553,7 +560,9 @@ mod tests {
         let rgba = render(text);
         let w = OVERLAY_W as usize;
         let lower_bright = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .skip((OVERLAY_H as usize / 2) * w)
             .filter(|p| p[2] > 170 && p[3] > 60)
             .count();
