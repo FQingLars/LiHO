@@ -62,6 +62,16 @@ fn secs(frame: usize) -> f32 {
         .max(0.0)
 }
 
+/// ONNX Runtime log sink: warning and above only.
+fn ort_logger(level: ort::logging::LogLevel, category: &str, _id: &str, _loc: &str, msg: &str) {
+    use ort::logging::LogLevel;
+    match level {
+        LogLevel::Verbose | LogLevel::Info => {}
+        LogLevel::Warning => log::warn!("onnxruntime[{category}]: {msg}"),
+        LogLevel::Error | LogLevel::Fatal => log::error!("onnxruntime[{category}]: {msg}"),
+    }
+}
+
 /// The model is strictly fixed-shape; anything else would be an ONNX error.
 pub fn check_chunk_len(len: usize) -> Result<(), String> {
     if len != CHUNK_SAMPLES {
@@ -92,12 +102,20 @@ impl Transcriber {
         }
         let env = ort::init()
             .with_name("liho")
+            // ONNX Runtime is extremely chatty at Info (every graph pass,
+            // every arena reservation); forward only what matters.
+            .with_logger(std::sync::Arc::new(ort_logger))
             .build()
             .map_err(|e| format!("onnxruntime env: {e}"))?;
         let session = Session::builder(&env)
             .map_err(|e| format!("onnxruntime session builder: {e}"))?
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
             .map_err(|e| format!("onnxruntime optimization level: {e}"))?
+            // ONNX Runtime logs every graph optimisation step at Info; that
+            // drowns the application log. Warnings and errors still come
+            // through.
+            .with_log_level(ort::logging::LogLevel::Warning)
+            .map_err(|e| format!("onnxruntime log level: {e}"))?
             .commit_from_file(model_path)
             .map_err(|e| format!("load T-one model {}: {e}", model_path.display()))?;
         info!(
