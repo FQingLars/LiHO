@@ -2,16 +2,24 @@
 //!
 //! Two threads keep listening and answering independent:
 //!
-//! **Listener**: pulls 8 kHz chunks from the capture, feeds them to T-one in
-//! 300 ms slices and accumulates the phrases it finalizes. As soon as the
-//! running text looks like an interview question
-//! ([`crate::question::is_question`]) and carries enough *new* characters, it
-//! is queued for answering **immediately** — the speaker does not have to
-//! finish. Whatever comes after the answered prefix becomes «Дополнение…».
+//! **Listener**: pulls 8 kHz chunks from every capture (microphone and system
+//! output), feeds each stream into its *own* T-one instance — streaming state
+//! is per audio source, two sources cannot share one — and appends every
+//! finalized phrase to a tagged transcript:
 //!
-//! **Answer worker**: consumes the queue strictly in order (one DeepSeek
-//! chat session must be threaded sequentially), drives the LLM through a
-//! dedicated current-thread runtime and updates the display.
+//! ```text
+//! Интервьюер: какой у вас опыт с kafka?
+//! Пользователь: я три года возился с ней в продакшене
+//! Интервьюер: а с какими версиями?
+//! ```
+//!
+//! Only the interviewer stream can trigger an answer
+//! ([crate::question::is_question]); the candidate's own words are context for
+//! it. Answering starts while the interviewer is still talking.
+//!
+//! **Answer worker**: consumes the queue strictly in order (one DeepSeek chat
+//! session must be threaded sequentially), drives the LLM through a dedicated
+//! current-thread runtime and updates the display.
 //!
 //! `stop` flips an atomic that ends both loops promptly.
 
@@ -22,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use log::{debug, error, info, warn};
 
-use crate::audio::CaptureHandle;
+use crate::audio::{CaptureHandle, Source};
 use crate::config::Config;
 use crate::display::OverlayCtl;
 use crate::llm::DeepSeekWeb;
@@ -31,17 +39,10 @@ use crate::tone::{CHUNK_SAMPLES, Transcriber};
 
 /// Minimum NEW characters before accumulated text may (re-)fire the LLM.
 const MIN_NEW_CHARS: usize = 12;
-/// Upper bound for the accumulated text; older speech is dropped.
+/// Upper bound for the interviewer's accumulated text; older speech is cut.
 const MAX_BUFFER_CHARS: usize = 2_000;
-
-/// What to send to the LLM when the transcript crosses a threshold.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Fire {
-    /// Message for the DeepSeek session.
-    pub message: String,
-    /// Transcript length that is now considered answered.
-    pub answered_chars: usize,
-}
+/// Upper bound for the whole tagged transcript sent to the LLM.
+const MAX_TRANSCRIPT_CHARS: usize = 2_000;
 
 /// Decides when the running transcript should trigger an answer.
 ///
@@ -50,14 +51,17 @@ pub struct Fire {
 ///
 /// * the accumulated text (or the fresh phrase alone) looks like a question —
 ///   answer it, even mid-sentence, and mark the question as open;
-/// * the speaker keeps talking about an open question — send one
-///   «Дополнение…» so the answer sees the rest of what was said;
+/// * the interviewer keeps talking about an open question — fire once more so
+///   the answer sees the rest of what was said;
 /// * anything else — stay quiet.
+///
+/// Returns the transcript offset to mark as answered *after* the message built
+/// from it is really queued (a failed send must not consume the text).
 #[derive(Debug, Default)]
 pub struct FirePolicy {
     answered_chars: usize,
     question_open: bool,
-    followup_sent: bool,
+    followup_fired: bool,
 }
 
 impl FirePolicy {
@@ -65,54 +69,131 @@ impl FirePolicy {
         Self::default()
     }
 
-    /// Transcript length already sent to the LLM.
+    /// Text length already sent to the LLM.
     pub fn answered_chars(&self) -> usize {
         self.answered_chars
     }
 
-    /// Re-base the offset after the transcript buffer was trimmed.
+    /// Re-base the offset after the text buffer was trimmed.
     pub fn set_answered_chars(&mut self, answered_chars: usize) {
         self.answered_chars = answered_chars;
     }
 
     /// Decide whether the freshly finalized `phrase` triggers an answer.
     ///
-    /// `buffer` is the whole transcript so far, `phrase` only the new text.
-    pub fn on_phrase(&mut self, buffer: &str, phrase: &str) -> Option<Fire> {
+    /// `buffer` is the interviewer's accumulated text, `phrase` the new text.
+    pub fn on_phrase(&mut self, buffer: &str, phrase: &str) -> Option<usize> {
         let n = buffer.chars().count();
         if n < self.answered_chars + MIN_NEW_CHARS {
             return None;
         }
         if is_question(buffer) || is_question(phrase) {
             self.question_open = true;
-            self.followup_sent = false;
-            return Some(Fire {
-                message: buffer.trim().to_string(),
-                answered_chars: n,
-            });
+            self.followup_fired = false;
+            return Some(n);
         }
-        if self.question_open && !self.followup_sent {
-            self.followup_sent = true;
-            return Some(Fire {
-                message: format!("Дополнение к предыдущему вопросу: {}", phrase.trim()),
-                answered_chars: n,
-            });
+        if self.question_open && !self.followup_fired {
+            self.followup_fired = true;
+            return Some(n);
         }
         None
     }
 
-    /// Call after a [`Fire`] was actually queued (send failures must not
-    /// advance the offset).
-    pub fn mark_sent(&mut self, fire: &Fire) {
-        self.answered_chars = fire.answered_chars;
+    /// Call once the message built from that offset reached the queue.
+    pub fn mark_sent(&mut self, answered_chars: usize) {
+        self.answered_chars = answered_chars;
     }
 }
 
-/// Keep the transcript bounded: cut off the oldest text, but never before
-/// what the LLM has already been given (that would re-answer old speech).
-///
-/// Returns the new text plus how many chars of the old answered prefix
-/// survived (the caller rebases [`FirePolicy::set_answered_chars`] with it).
+/// The tagged transcript plus the fire policy — everything the listener needs
+/// to decide *what* to send.
+pub struct ListenState {
+    transcript: String,
+    interviewer: String,
+    policy: FirePolicy,
+    system_prompt: String,
+    system_sent: bool,
+    /// Offset decided by the last `on_phrase`, confirmed by `mark_sent`
+    /// once the message reached the queue.
+    pending_answered: usize,
+}
+
+impl ListenState {
+    pub fn new(system_prompt: &str) -> Self {
+        Self {
+            transcript: String::new(),
+            interviewer: String::new(),
+            policy: FirePolicy::new(),
+            system_prompt: system_prompt.to_string(),
+            system_sent: false,
+            pending_answered: 0,
+        }
+    }
+
+    /// Feed one finalized phrase. Returns the message to queue, if any.
+    ///
+    /// Every phrase is appended to the transcript; only the interviewer's
+    /// phrases can trigger an answer.
+    pub fn on_phrase(&mut self, source: Source, phrase: &str) -> Option<String> {
+        let phrase = phrase.trim();
+        if phrase.is_empty() {
+            return None;
+        }
+        self.transcript.push_str(source.label());
+        self.transcript.push_str(": ");
+        self.transcript.push_str(phrase);
+        self.transcript.push('\n');
+        self.trim_transcript();
+
+        if source != Source::Interviewer {
+            return None;
+        }
+
+        self.interviewer.push_str(phrase);
+        self.interviewer.push(' ');
+        let (trimmed, survived) = trim_buffer(&self.interviewer, self.policy.answered_chars());
+        self.interviewer = trimmed;
+        self.policy.set_answered_chars(survived);
+
+        let answered = self.policy.on_phrase(&self.interviewer, phrase)?;
+        self.pending_answered = answered;
+        if self.system_sent {
+            Some(self.transcript.clone())
+        } else {
+            self.system_sent = true;
+            Some(format!(
+                "{}\n\nДиалог (реплики помечены спикером):\n{}",
+                self.system_prompt,
+                self.transcript.trim_end()
+            ))
+        }
+    }
+
+    /// Confirm that the message from the last `on_phrase` was queued.
+    pub fn mark_sent(&mut self) {
+        let answered = self.pending_answered;
+        self.policy.mark_sent(answered);
+    }
+
+    /// Keep the transcript bounded, dropping whole lines only.
+    fn trim_transcript(&mut self) {
+        let total = self.transcript.chars().count();
+        if total <= MAX_TRANSCRIPT_CHARS {
+            return;
+        }
+        let cut = total - MAX_TRANSCRIPT_CHARS;
+        let rest: String = self.transcript.chars().skip(cut).collect();
+        self.transcript = match rest.find('\n') {
+            Some(i) => rest[i + 1..].to_string(),
+            None => rest,
+        };
+    }
+}
+
+/// Keep the interviewer's text bounded: cut off the oldest text, but never
+/// before what the LLM has already been given (that would re-answer old
+/// speech). Returns the new text plus how many chars of the answered prefix
+/// survived.
 pub fn trim_buffer(text: &str, answered_chars: usize) -> (String, usize) {
     let total = text.chars().count();
     if total <= MAX_BUFFER_CHARS {
@@ -124,17 +205,27 @@ pub fn trim_buffer(text: &str, answered_chars: usize) -> (String, usize) {
     (kept, answered_chars.saturating_sub(at))
 }
 
+/// One conversation side: its capture, its T-one state and its buffer.
+struct Stream {
+    source: Source,
+    capture: CaptureHandle,
+    transcriber: Transcriber,
+    pending: Vec<i16>,
+}
+
 pub struct Pipeline;
 
 impl Pipeline {
     /// Spawn listener + answer-worker threads.
-    /// Set `stop`, then join the returned handle(s) via [`Self::join`].
+    ///
+    /// `streams` pairs each capture with its own T-one instance; the speaker
+    /// label comes from the capture itself.
+    /// Set `stop`, then join the returned handle(s) via `join_worker`.
     pub fn spawn(
         cfg: Config,
         llm: Arc<DeepSeekWeb>,
         session_id: String,
-        transcriber: Transcriber,
-        capture: CaptureHandle,
+        streams: Vec<(CaptureHandle, Transcriber)>,
         overlay: OverlayCtl,
         stop: Arc<AtomicBool>,
     ) -> std::thread::JoinHandle<()> {
@@ -159,15 +250,15 @@ impl Pipeline {
 
         let listener = std::thread::Builder::new()
             .name("liho-listener".into())
-            .spawn(move || listen(cfg, transcriber, capture, overlay, q_tx, stop))
+            .spawn(move || listen(cfg, streams, overlay, q_tx, stop))
             .expect("spawn listener");
 
         LISTENER_WORKER.lock().unwrap().replace(worker);
         listener
     }
 
-    /// Join the answer-worker started by [`Pipeline::spawn`] (listener is
-    /// joined by the handle returned there).
+    /// Join the answer-worker started by `spawn` (the listener is joined by
+    /// the handle returned there).
     pub fn join_worker() {
         if let Some(h) = LISTENER_WORKER.lock().unwrap().take() {
             let _ = h.join();
@@ -180,93 +271,93 @@ static LISTENER_WORKER: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
 
 fn listen(
     cfg: Config,
-    mut transcriber: Transcriber,
-    capture: CaptureHandle,
+    streams: Vec<(CaptureHandle, Transcriber)>,
     overlay: OverlayCtl,
     q_tx: mpsc::Sender<String>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut pending: Vec<i16> = Vec::with_capacity(CHUNK_SAMPLES * 4);
-    let mut text = String::new();
-    let mut policy = FirePolicy::new();
-    let mut system_sent = false;
+    let mut streams: Vec<Stream> = streams
+        .into_iter()
+        .map(|(capture, transcriber)| Stream {
+            source: capture.source(),
+            capture,
+            transcriber,
+            pending: Vec::with_capacity(CHUNK_SAMPLES * 4),
+        })
+        .collect();
+    let labels: Vec<&str> = streams.iter().map(|s| s.source.label()).collect();
+    let mut state = ListenState::new(&cfg.system_prompt);
     let mut chunks_seen = 0u64;
     let mut stats_at = Instant::now();
 
-    info!("listener started: T-one streaming, {CHUNK_SAMPLES}-sample slices");
+    info!(
+        "listener started: {} stream(s) [{}], T-one {CHUNK_SAMPLES}-sample slices",
+        streams.len(),
+        labels.join(", ")
+    );
 
     while !stop.load(Ordering::SeqCst) {
-        let Some(chunk) = capture.try_recv() else {
-            std::thread::sleep(Duration::from_millis(20));
-            continue;
-        };
-        chunks_seen += 1;
-        pending.extend_from_slice(&chunk);
-
-        if pending.len() < CHUNK_SAMPLES {
-            if stats_at.elapsed() > Duration::from_secs(10) {
-                stats_at = Instant::now();
-                debug!(
-                    "stats: chunks={chunks_seen}, dropped={}, buffered={}",
-                    capture.dropped_chunks.load(Ordering::Relaxed),
-                    pending.len()
-                );
+        let mut got_audio = false;
+        for stream in &mut streams {
+            while let Some(chunk) = stream.capture.try_recv() {
+                got_audio = true;
+                chunks_seen += 1;
+                stream.pending.extend_from_slice(&chunk);
             }
-            continue;
-        }
+            if stream.pending.len() < CHUNK_SAMPLES {
+                continue;
+            }
 
-        // ---- streaming STT: consume every full 300 ms slice we can ----
-        let mut new_text = String::new();
-        while pending.len() >= CHUNK_SAMPLES {
-            let slice: Vec<i16> = pending.drain(..CHUNK_SAMPLES).collect();
-            match transcriber.forward(&slice, false) {
-                Ok(phrases) => {
-                    for p in phrases {
-                        new_text.push_str(&p.text);
-                        new_text.push(' ');
+            // ---- streaming STT: consume every full 300 ms slice ----
+            while stream.pending.len() >= CHUNK_SAMPLES {
+                let slice: Vec<i16> = stream.pending.drain(..CHUNK_SAMPLES).collect();
+                let phrases = match stream.transcriber.forward(&slice, false) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!("STT failed on {}: {e}", stream.source.label());
+                        break;
+                    }
+                };
+                for p in phrases {
+                    if p.text.trim().is_empty() {
+                        continue;
+                    }
+                    info!("STT {}: “{}”", stream.source.label(), p.text.trim());
+                    if let Some(message) = state.on_phrase(stream.source, &p.text) {
+                        info!("fire: “{}”", message.lines().last().unwrap_or("").trim());
+                        overlay.set_text("Понял вопрос, отвечаю…");
+                        if send_raw(&q_tx, message) {
+                            state.mark_sent();
+                        }
                     }
                 }
-                Err(e) => {
-                    error!("STT failed: {e}");
-                    break;
-                }
             }
         }
 
-        if new_text.trim().is_empty() {
+        if !got_audio {
+            std::thread::sleep(Duration::from_millis(20));
             continue;
         }
-        info!("STT: “{}”", new_text.trim());
-
-        // ---- accumulate and answer in parallel with the speaker ----
-        text.push_str(&new_text);
-        let (trimmed, survived) = trim_buffer(&text, policy.answered_chars());
-        text = trimmed;
-        policy.set_answered_chars(survived);
-
-        let Some(fire) = policy.on_phrase(&text, new_text.trim()) else {
-            continue;
-        };
-        info!("fire: “{}”", fire.message);
-        overlay.set_text("Понял вопрос, отвечаю…");
-        if send_raw(
-            &q_tx,
-            wrap_first(&cfg.system_prompt, &mut system_sent, &fire.message),
-        ) {
-            policy.mark_sent(&fire);
+        if stats_at.elapsed() > Duration::from_secs(10) {
+            stats_at = Instant::now();
+            let dropped: Vec<String> = streams
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}={}",
+                        s.source.label(),
+                        s.capture.dropped_chunks.load(Ordering::Relaxed)
+                    )
+                })
+                .collect();
+            debug!(
+                "stats: chunks={chunks_seen}, dropped [{}]",
+                dropped.join(", ")
+            );
         }
     }
 
     info!("listener stopped");
-}
-
-fn wrap_first(system_prompt: &str, system_sent: &mut bool, text: &str) -> String {
-    if *system_sent {
-        text.to_string()
-    } else {
-        *system_sent = true;
-        format!("{system_prompt}\n\nВопрос интервьюера: {text}")
-    }
 }
 
 fn send_raw(q_tx: &mpsc::Sender<String>, msg: String) -> bool {
@@ -338,15 +429,40 @@ fn answer_worker(
 mod tests {
     use super::*;
 
-    fn policy_after(chunks: &[(&str, &str)]) -> (FirePolicy, Vec<Fire>) {
+    const PROMPT: &str = "Ты — ассистент на интервью.";
+
+    /// Feed phrases from one source and collect the messages that fired.
+    fn run(sources: &[(Source, &str)]) -> Vec<String> {
+        let mut st = ListenState::new(PROMPT);
+        let mut out = Vec::new();
+        for (source, phrase) in sources {
+            if let Some(msg) = st.on_phrase(*source, phrase) {
+                st.mark_sent();
+                out.push(msg);
+            }
+        }
+        out
+    }
+
+    fn transcript_of(sources: &[(Source, &str)]) -> String {
+        let mut st = ListenState::new(PROMPT);
+        for (source, phrase) in sources {
+            st.on_phrase(*source, phrase);
+        }
+        st.transcript
+    }
+
+    // ---- fire policy -------------------------------------------------
+
+    fn policy_after(chunks: &[&str]) -> (FirePolicy, Vec<usize>) {
         let mut p = FirePolicy::new();
         let mut buffer = String::new();
         let mut fires = Vec::new();
-        for (phrase, _expect) in chunks {
+        for phrase in chunks {
             buffer.push_str(phrase);
-            if let Some(f) = p.on_phrase(&buffer, phrase) {
-                p.mark_sent(&f);
-                fires.push(f);
+            if let Some(answered) = p.on_phrase(&buffer, phrase) {
+                p.mark_sent(answered);
+                fires.push(answered);
             }
         }
         (p, fires)
@@ -354,20 +470,16 @@ mod tests {
 
     #[test]
     fn plain_statement_does_not_fire() {
-        let (p, f) = policy_after(&[("я расскажу про свой опыт работы ", "")]);
+        let (p, f) = policy_after(&["я расскажу про свой опыт работы "]);
         assert!(f.is_empty());
         assert_eq!(p.answered_chars(), 0);
     }
 
     #[test]
     fn question_with_enough_new_chars_fires() {
-        let (_, f) = policy_after(&[("вы работали с kafka в продакшене? ", "")]);
+        let (_, f) = policy_after(&["вы работали с kafka в продакшене? "]);
         assert_eq!(f.len(), 1);
-        assert!(f[0].message.contains("kafka"));
-        assert_eq!(
-            f[0].answered_chars,
-            "вы работали с kafka в продакшене? ".chars().count()
-        );
+        assert_eq!(f[0], "вы работали с kafka в продакшене? ".chars().count());
     }
 
     #[test]
@@ -379,80 +491,162 @@ mod tests {
 
     #[test]
     fn short_text_never_fires() {
-        assert!(FirePolicy::new().on_phrase("да?", "да?").is_none());
+        let mut p = FirePolicy::new();
+        assert!(p.on_phrase("да?", "да?").is_none());
     }
 
     #[test]
-    fn continuation_of_open_question_sends_one_followup() {
+    fn continuation_of_open_question_fires_once() {
         let (_, f) = policy_after(&[
-            ("какие у вас были обязанности? ", ""),
-            (
-                "я руководил командой из пяти человек и отвечал за найм ",
-                "",
-            ),
-            ("а ещё мы запускали еженедельные релизы ", ""),
+            "какие у вас были обязанности? ",
+            "я руководил командой из пяти человек и отвечал за найм ",
+            "а ещё мы запускали еженедельные релизы ",
         ]);
         assert_eq!(f.len(), 2, "question + exactly one followup: {f:?}");
-        assert!(
-            f[1].message
-                .starts_with("Дополнение к предыдущему вопросу:")
-        );
-        assert!(f[1].message.contains("руководил"));
     }
 
     #[test]
-    fn followup_after_new_question_is_not_a_supplement() {
+    fn followup_after_new_question_fires_again() {
         let (_, f) = policy_after(&[
-            ("вы работали с kafka в продакшене? ", ""),
-            ("а с какими версиями брокеров? ", ""),
+            "вы работали с kafka в продакшене? ",
+            "а с какими версиями брокеров? ",
         ]);
         assert_eq!(f.len(), 2);
-        assert!(
-            !f[1].message.starts_with("Дополнение"),
-            "{:?}",
-            f[1].message
-        );
     }
 
     #[test]
-    fn monologue_after_answered_question_stays_quiet() {
+    fn monologue_after_question_stays_quiet() {
         let (_, f) = policy_after(&[
-            ("какие у вас были обязанности? ", ""),
-            ("спасибо, очень подробно ", ""),
-            ("кстати, в следующем раунде спросят про деплой ", ""),
+            "какие у вас были обязанности? ",
+            "спасибо, очень подробно ",
+            "кстати, в следующем раунде спросят про деплой ",
         ]);
-        assert_eq!(f.len(), 2, "only the followup is sent: {f:?}");
+        assert_eq!(f.len(), 2, "only the followup: {f:?}");
     }
 
+    // ---- speaker tagging ---------------------------------------------
+
     #[test]
-    fn failed_send_does_not_advance_offset() {
-        let mut p = FirePolicy::new();
-        let fire = p
-            .on_phrase(
-                "вы работали с kafka в продакшене?",
-                "вы работали с kafka в продакшене?",
-            )
-            .expect("question fires");
-        // Simulate a closed queue: mark_sent is never called.
-        assert_eq!(p.answered_chars(), 0);
-        let again = p.on_phrase(
-            "вы работали с kafka в продакшене? а с какими версиями?",
-            " а с какими версиями?",
+    fn every_phrase_is_tagged_with_its_speaker() {
+        let t = transcript_of(&[
+            (Source::Interviewer, "какой у вас опыт"),
+            (Source::User, "я три года работал с kafka"),
+        ]);
+        assert!(t.contains("Интервьюер: какой у вас опыт\n"), "{t}");
+        assert!(
+            t.contains("Пользователь: я три года работал с kafka\n"),
+            "{t}"
         );
-        assert!(again.is_some(), "must retry after a failed send");
-        p.mark_sent(&fire);
-        assert_eq!(p.answered_chars(), fire.answered_chars);
     }
 
     #[test]
-    fn trim_keeps_short_text_untouched() {
+    fn candidate_speech_alone_never_fires() {
+        let out = run(&[
+            (Source::User, "вы работали с kafka в продакшене давно"),
+            (Source::User, "а с какими версиями брокеров?"),
+        ]);
+        assert!(
+            out.is_empty(),
+            "candidate must not trigger answers: {out:?}"
+        );
+    }
+
+    #[test]
+    fn interviewer_question_carries_candidate_context() {
+        let out = run(&[
+            (Source::User, "я три года работал с kafka в продакшене"),
+            (Source::Interviewer, "а с какими версиями брокеров?"),
+        ]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        let msg = &out[0];
+        assert!(msg.contains("Пользователь: я три года работал"), "{msg}");
+        assert!(msg.contains("Интервьюер: а с какими версиями"), "{msg}");
+    }
+
+    #[test]
+    fn system_prompt_goes_out_only_once() {
+        let out = run(&[
+            (
+                Source::Interviewer,
+                "какой у вас опыт с kafka в продакшене?",
+            ),
+            (
+                Source::Interviewer,
+                "а с какими версиями брокеров вы работали?",
+            ),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].starts_with(PROMPT), "{:?}", out[0]);
+        assert!(!out[1].contains(PROMPT), "prompt repeated: {:?}", out[1]);
+    }
+
+    #[test]
+    fn first_message_explains_the_tags() {
+        let out = run(&[(Source::Interviewer, "какой у вас опыт с kafka?")]);
+        assert!(out[0].contains("Диалог"), "{:?}", out[0]);
+    }
+
+    #[test]
+    fn failed_send_retries_the_same_question() {
+        let mut st = ListenState::new(PROMPT);
+        let q = "вы работали с kafka в продакшене?";
+        assert!(st.on_phrase(Source::Interviewer, q).is_some());
+        // No mark_sent: the message was lost, the question must fire again.
+        assert!(st.on_phrase(Source::Interviewer, q).is_some());
+    }
+
+    #[test]
+    fn empty_and_blank_phrases_are_ignored() {
+        let mut st = ListenState::new(PROMPT);
+        assert!(st.on_phrase(Source::Interviewer, "").is_none());
+        assert!(st.on_phrase(Source::Interviewer, "   ").is_none());
+        assert!(st.transcript.is_empty());
+    }
+
+    // ---- bounds -------------------------------------------------------
+
+    #[test]
+    fn transcript_is_bounded_and_line_aligned() {
+        let mut st = ListenState::new(PROMPT);
+        for _ in 0..200 {
+            st.on_phrase(
+                Source::Interviewer,
+                "разговор про распределённые системы и очереди",
+            );
+        }
+        assert!(
+            st.transcript.chars().count() <= MAX_TRANSCRIPT_CHARS,
+            "transcript grew to {}",
+            st.transcript.chars().count()
+        );
+        assert!(
+            st.transcript.starts_with("Интервьюер:"),
+            "{:?}",
+            &st.transcript[..40]
+        );
+    }
+
+    #[test]
+    fn interviewer_buffer_is_bounded() {
+        let mut st = ListenState::new(PROMPT);
+        for _ in 0..200 {
+            st.on_phrase(
+                Source::Interviewer,
+                "очень длинная реплика без вопроса вообще",
+            );
+        }
+        assert!(st.interviewer.chars().count() <= MAX_BUFFER_CHARS);
+    }
+
+    #[test]
+    fn trim_buffer_keeps_short_text_untouched() {
         let (t, a) = trim_buffer("короткий вопрос?", 0);
         assert_eq!(t, "короткий вопрос?");
         assert_eq!(a, 0);
     }
 
     #[test]
-    fn trim_drops_old_text_and_rebases_answered_offset() {
+    fn trim_buffer_drops_old_text_and_rebases_answered_offset() {
         let text = "а ".repeat(MAX_BUFFER_CHARS * 2);
         let (t, a) = trim_buffer(&text, 0);
         assert_eq!(t.chars().count(), MAX_BUFFER_CHARS);
@@ -461,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_does_not_re_introduce_already_answered_text() {
+    fn trim_buffer_does_not_re_introduce_already_answered_text() {
         let tail = "новый вопрос про kafka?";
         let text = format!("{}{}", "старое ".repeat(MAX_BUFFER_CHARS), tail);
         let answered = MAX_BUFFER_CHARS * 7;

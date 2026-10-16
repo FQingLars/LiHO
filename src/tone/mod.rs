@@ -25,6 +25,7 @@ pub mod decoder;
 pub mod splitter;
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use half::f16;
 use log::{debug, info};
@@ -60,6 +61,26 @@ pub struct TextPhrase {
 fn secs(frame: usize) -> f32 {
     (frame as f32 * FRAME_SECONDS - MEAN_TIME_BIAS - PADDING_SAMPLES as f32 / SAMPLE_RATE as f32)
         .max(0.0)
+}
+
+/// The process-wide ONNX Runtime environment.
+///
+/// ONNX Runtime allows exactly one environment per process, while every
+/// conversation side needs its own session (streaming state is per audio
+/// source). Sessions are created from this shared environment.
+fn shared_env() -> Result<&'static ort::environment::Environment, String> {
+    static ENV: OnceLock<Result<ort::environment::Environment, String>> = OnceLock::new();
+    ENV.get_or_init(|| {
+        ort::init()
+            .with_name("liho")
+            // ONNX Runtime is extremely chatty at Info (every graph pass,
+            // every arena reservation); forward only what matters.
+            .with_logger(std::sync::Arc::new(ort_logger))
+            .build()
+            .map_err(|e| format!("onnxruntime env: {e}"))
+    })
+    .as_ref()
+    .map_err(|e| e.clone())
 }
 
 /// ONNX Runtime log sink: warning and above only.
@@ -100,14 +121,8 @@ impl Transcriber {
                 model_path.display()
             ));
         }
-        let env = ort::init()
-            .with_name("liho")
-            // ONNX Runtime is extremely chatty at Info (every graph pass,
-            // every arena reservation); forward only what matters.
-            .with_logger(std::sync::Arc::new(ort_logger))
-            .build()
-            .map_err(|e| format!("onnxruntime env: {e}"))?;
-        let session = Session::builder(&env)
+        let env = shared_env()?;
+        let session = Session::builder(env)
             .map_err(|e| format!("onnxruntime session builder: {e}"))?
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
             .map_err(|e| format!("onnxruntime optimization level: {e}"))?

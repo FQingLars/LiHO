@@ -5,13 +5,18 @@ microphone, an LLM answer while the interviewer is still talking, and the
 answer on screen.
 
 ```
-microphone ──▶ cpal ──▶ 8 kHz mono i16 ──▶ T-one (ONNX, streaming CTC)
-                                                   │ phrases
-                                                   ▼
-                                            question heuristic
-                                                   │
-                                                   ▼
-                              DeepSeek web chat ──▶ answer on screen
+microphone ──▶ cpal ─────────────┐
+                                ├─▶ 8 kHz mono i16 ──▶ T-one (ONNX, streaming CTC)
+system output ─▶ loopback ───────┘        (one model instance per stream)
+                                                 │ phrases
+                                                 ▼
+                                   tagged transcript
+                              «Интервьюер: …» / «Пользователь: …»
+                                                 │
+                                       question heuristic
+                                       (interviewer only)
+                                                 ▼
+                             DeepSeek web chat ──▶ answer on screen
 ```
 
 * **STT**: [T-one](https://huggingface.co/t-tech/T-one) (`t-tech/T-one`,
@@ -19,7 +24,8 @@ microphone ──▶ cpal ──▶ 8 kHz mono i16 ──▶ T-one (ONNX, stream
   specialised for telephony. Fed with raw 8 kHz int16 in 300 ms chunks; it
   emits finalized phrases ~600 ms after a pause. The Rust port lives in
   `src/tone/` (acoustic model via ONNX Runtime, logprob splitter, greedy CTC
-  decoder).
+  decoder). Streaming state is per audio source, so each speaker gets its own
+  model instance.
 * **LLM**: DeepSeek web chat (`chat.deepseek.com/api/v0/*`) with a browser
   `userToken`, a PoW gate and a single threaded chat session.
 * **Display**: a Wayland layer-shell overlay on Linux, stdout on Windows and
@@ -27,11 +33,17 @@ microphone ──▶ cpal ──▶ 8 kHz mono i16 ──▶ T-one (ONNX, stream
 
 ## Platforms
 
-| | audio | answer output |
-|---|---|---|
-| Linux | `cpal` (PulseAudio/ALSA) | Wayland overlay panel (top-right, click-through, `--autohide-ms`) |
-| Windows | `cpal` (WASAPI) | stdout |
-| macOS | `cpal` (CoreAudio) | stdout |
+| | microphone | system output (loopback) | answer output |
+|---|---|---|---|
+| Linux | `cpal` (PulseAudio/ALSA) | PipeWire sink monitor | Wayland overlay panel (top-right, click-through, `--autohide-ms`) |
+| Windows | `cpal` (WASAPI) | WASAPI loopback | stdout |
+| macOS | `cpal` (CoreAudio) | — (not implemented) | stdout |
+
+The two audio sources are tagged in the transcript: the microphone is
+«Пользователь» (the candidate), the system output is «Интервьюер» (the call).
+Only the interviewer's words can trigger an answer; the candidate's speech is
+context for it. If the loopback cannot start, LIhO logs a warning and keeps
+running on the microphone alone.
 
 ## Build
 
@@ -86,8 +98,9 @@ logprob splitter to the numbers produced by the original Python code;
 
 ## Notes
 
-* T-one is Russian-only and telephony-oriented. Mic capture is what the
-  device gives us; a loopback of the system sink is not implemented.
+* T-one is Russian-only and telephony-oriented.
+* Use headphones: with speakers, the microphone hears the interviewer too and
+  both streams transcribe the same words. There is no echo cancellation.
 * The greedy decoder is used instead of the upstream KenLM beam search
   because KenLM has no Windows build.
 * On Linux with Hyprland, adding

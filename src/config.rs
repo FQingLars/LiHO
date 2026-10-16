@@ -5,8 +5,11 @@ use std::collections::HashMap;
 
 use log::info;
 
-/// Default role instruction sent with the first question of the session.
-pub const DEFAULT_SYSTEM_PROMPT: &str = "Ты — ассистент на техническом интервью. Тебе пересылают распознанный текст вопроса интервьюера. Отвечай кратко и продукто-ориентированно, как будто мы заявляем о преимуществе решения для продукта. Первый ответ — сразу суть, без вступлений. Язык ответа — язык вопроса.";
+/// Default role instruction sent with the first message of the session.
+///
+/// The prompt receives a rolling, speaker-tagged transcript of the call
+/// ("Интервьюер: …" / "Пользователь: …"), not a bare question.
+pub const DEFAULT_SYSTEM_PROMPT: &str = "Ты — ассистент на техническом интервью за кандидата. Тебе пересылают расшифровку диалога: реплики интервьюера помечены «Интервьюер», реплики кандидата — «Пользователь». Отвечай только на последний вопрос интервьюера, опираясь на контекст диалога. Отвечай кратко и продукто-ориентированно, как будто мы заявляем о преимуществе решения для продукта. Первый ответ — сразу суть, без вступлений. Язык ответа — язык вопроса.";
 
 #[derive(Debug, Clone)]
 pub struct Config {

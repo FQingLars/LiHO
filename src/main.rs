@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use env_logger::Env;
-use log::{error, info};
+use log::{error, info, warn};
 
 mod audio;
 mod config;
@@ -58,9 +58,27 @@ async fn run() -> Result<(), String> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // 3. Audio + STT
-    let capture = audio::start_capture()?;
-    let transcriber = tone::Transcriber::load(&cfg.stt_model)?;
+    // 3. Audio + STT: one capture (and one streaming model) per speaker.
+    let mut streams = Vec::new();
+    for source in [audio::Source::User, audio::Source::Interviewer] {
+        match audio::start_capture(source) {
+            Ok(capture) => {
+                // Streaming state is per audio source — a second T-one
+                // instance costs memory, not accuracy.
+                let transcriber = tone::Transcriber::load(&cfg.stt_model)?;
+                info!("{} stream ready", source.label());
+                streams.push((capture, transcriber));
+            }
+            Err(e) if source == audio::Source::User => {
+                return Err(format!("микрофон недоступен: {e}"));
+            }
+            Err(e) => {
+                // Loopback is a bonus: without it the app still works, it
+                // just cannot separate the interviewer from the candidate.
+                warn!("{source:?} stream unavailable ({e}) — continuing without it");
+            }
+        }
+    }
     overlay_ctl.set_text("Модели загружены");
 
     // 4. LLM: persistent single-chat session
@@ -88,8 +106,7 @@ async fn run() -> Result<(), String> {
         cfg,
         Arc::clone(&llm),
         session_id,
-        transcriber,
-        capture,
+        streams,
         overlay_ctl,
         Arc::clone(&stop),
     );

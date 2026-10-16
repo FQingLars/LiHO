@@ -26,12 +26,18 @@ cpal = "0.15"
 # The overlay is a Wayland layer-shell: Linux only. Windows and macOS fall
 # back to the console backend (see src/display/mod.rs).
 [target.'cfg(target_os = "linux")'.dependencies]
+# Loopback capture of the system output (sink monitor) — the interviewer's side.
+pipewire = "0.10"
 wayland-client = "0.31"
 smithay-client-toolkit = "0.21"
 cosmic-text = "0.19"
 tiny-skia = "0.12"
 calloop = "0.14"
 calloop-wayland-source = "0.4"
+
+# WASAPI bindings for the loopback capture of the system output on Windows.
+[target.'cfg(target_os = "windows")'.dependencies]
+wasapi = "0.26"
 
 [dev-dependencies]
 hound = "3.5"
