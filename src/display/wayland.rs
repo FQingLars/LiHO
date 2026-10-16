@@ -229,16 +229,17 @@ fn run_overlay(
         if let Err(e) = state.conn.flush() {
             debug!("overlay pre-draw flush: {e}");
         }
-        if let Some(deadline) = state.hide_at {
-            if std::time::Instant::now() >= deadline && state.visible {
-                state.visible = false;
-                state.hide_at = None;
-                // True unmap: an unmapped layer produces no redaction box
-                // in share frames (Hyprland no_screen_share pass).
-                unmap(&state.layer);
-                state.configured_done = false;
-                info!("overlay auto-hidden (unmapped)");
-            }
+        if state
+            .hide_at
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline && state.visible)
+        {
+            state.visible = false;
+            state.hide_at = None;
+            // True unmap: an unmapped layer produces no redaction box in share
+            // frames (Hyprland no_screen_share pass).
+            unmap(&state.layer);
+            state.configured_done = false;
+            info!("overlay auto-hidden (unmapped)");
         }
         if !state.dirty || !state.configured_done {
             continue;

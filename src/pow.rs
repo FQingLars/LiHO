@@ -14,6 +14,18 @@ use wasmi::{Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
 
 const WASM: &[u8] = include_bytes!("../assets/pow_solver.wasm");
 
+/// `wasm_solve(retptr, challenge_ptr, challenge_len, prefix_ptr, prefix_len, difficulty)`
+type SolveFn = TypedFunc<(i32, i32, i32, i32, i32, f64), ()>;
+/// `wasm_alloc(size, align) -> ptr`
+type AllocFn = TypedFunc<(i32, i32), i32>;
+
+/// The strings and difficulty handed to the wasm solver.
+struct SolveInput<'a> {
+    challenge: &'a str,
+    prefix: &'a str,
+    difficulty: f64,
+}
+
 /// Challenge issued by `/api/v0/chat/create_pow_challenge`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PowChallenge {
@@ -37,8 +49,7 @@ impl PowSolver {
     /// Compile and instantiate the embedded module.
     pub fn new() -> Result<Self, String> {
         let engine = Engine::default();
-        let module =
-            Module::new(&engine, &mut WASM.as_ref()).map_err(|e| format!("PoW wasm parse: {e}"))?;
+        let module = Module::new(&engine, WASM).map_err(|e| format!("PoW wasm parse: {e}"))?;
         let mut store = Store::new(&engine, ());
         let linker: Linker<()> = Linker::new(&engine);
         let instance = linker
@@ -81,9 +92,11 @@ impl PowSolver {
             &alloc,
             memory,
             retptr,
-            &c.challenge,
-            &prefix,
-            c.difficulty,
+            &SolveInput {
+                challenge: &c.challenge,
+                prefix: &prefix,
+                difficulty: c.difficulty,
+            },
         );
 
         let _ = add_to_stack.call(&mut self.store, (16,));
@@ -92,13 +105,11 @@ impl PowSolver {
 
     fn write_and_solve(
         &mut self,
-        solve: &TypedFunc<(i32, i32, i32, i32, i32, f64), ()>,
-        alloc: &TypedFunc<(i32, i32), i32>,
+        solve: &SolveFn,
+        alloc: &AllocFn,
         memory: Memory,
         retptr: i32,
-        challenge: &str,
-        prefix: &str,
-        difficulty: f64,
+        input: &SolveInput<'_>,
     ) -> Result<f64, String> {
         let put = |store: &mut Store<()>, s: &str| -> Result<(i32, usize), String> {
             let bytes = s.as_bytes();
@@ -117,8 +128,8 @@ impl PowSolver {
             memory.data_mut(&mut *store)[start..end].copy_from_slice(bytes);
             Ok((ptr, bytes.len()))
         };
-        let (ch_ptr, ch_len) = put(&mut self.store, challenge)?;
-        let (pr_ptr, pr_len) = put(&mut self.store, prefix)?;
+        let (ch_ptr, ch_len) = put(&mut self.store, input.challenge)?;
+        let (pr_ptr, pr_len) = put(&mut self.store, input.prefix)?;
 
         solve
             .call(
@@ -129,7 +140,7 @@ impl PowSolver {
                     ch_len as i32,
                     pr_ptr,
                     pr_len as i32,
-                    difficulty,
+                    input.difficulty,
                 ),
             )
             .map_err(|e| format!("wasm_solve trap: {e}"))?;
@@ -185,6 +196,11 @@ pub fn pow_response_header(c: &PowChallenge, answer: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Threshold readers: a name plus a way to read a u64 out of a digest.
+    type DigestReaders = Vec<(&'static str, Box<dyn Fn(&[u8; 32]) -> u64>)>;
+    /// Input builders: a name plus a way to build the mined input string.
+    type InputBuilders = Vec<(&'static str, Box<dyn Fn(u64) -> String>)>;
 
     fn sample_challenge(difficulty: f64) -> PowChallenge {
         PowChallenge {
@@ -396,6 +412,7 @@ mod tests {
         ];
 
         struct Oracle {
+            #[allow(dead_code)] // kept for the offline mining probes
             prefix: String,
             d: u64,
             c_bytes: [u8; 32],
@@ -420,7 +437,7 @@ mod tests {
             for n in 0..=n_star {
                 let input = format!("{prefix}{n}");
                 let mut row = [0u64; 5];
-                for (hi, (h, _)) in hashers.iter().enumerate() {
+                for (h, _) in &hashers {
                     let dig: [u8; 32] = match h {
                         H::Sha3 => Sha3_256::digest(input.as_bytes()).into(),
                         H::Keccak => Keccak256::digest(input.as_bytes()).into(),
@@ -445,7 +462,7 @@ mod tests {
         println!("loaded {} oracles", oracles.len());
 
         // Challenge-head candidates for the formula side.
-        let c_variants: Vec<(&str, Box<dyn Fn(&[u8; 32]) -> u64>)> = vec![
+        let c_variants: DigestReaders = vec![
             (
                 "cBE8",
                 Box::new(|c: &[u8; 32]| u64::from_be_bytes(c[0..8].try_into().unwrap())),
@@ -560,12 +577,12 @@ mod tests {
         // 256-bit helpers over [u8; 32] (big-endian semantics).
         fn leading_zero_bits(h: &[u8; 32]) -> u32 {
             h.iter()
-                .map(|b| b.leading_zeros() as u32)
+                .map(|b| b.leading_zeros())
                 .take_while(|z| *z == 8)
                 .sum::<u32>()
                 + h.iter()
                     .find(|b| **b != 0)
-                    .map(|b| b.leading_zeros() as u32)
+                    .map(|b| b.leading_zeros())
                     .unwrap_or(0)
         }
         fn be_mod(h: &[u8; 32], d: u64) -> u64 {
@@ -600,7 +617,7 @@ mod tests {
             }
         }
 
-        let inputs: Vec<(&str, Box<dyn Fn(u64) -> String>)> = vec![
+        let inputs: InputBuilders = vec![
             ("prefix+dec", {
                 let p = prefix.clone();
                 Box::new(move |n| format!("{p}{n}"))
@@ -670,7 +687,8 @@ mod tests {
                     (
                         "first4 mod d == 0",
                         Box::new(|h: &[u8; 32]| {
-                            u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as u64 % difficulty == 0
+                            (u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as u64)
+                                .is_multiple_of(difficulty)
                         }),
                     ),
                 ] {

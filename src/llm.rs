@@ -76,21 +76,6 @@ fn preview(s: &str) -> String {
     s.chars().take(300).collect()
 }
 
-/// Incremental SSE parser for the DeepSeek web JSON-patch protocol.
-/// Feed raw network chunks; it buffers blank-line-separated events and
-/// accumulates answer content.
-///
-/// Protocol (captured live, see tests):
-/// - `data:` lines carry JSON patches;
-/// - `{"p":"<path>","o":"<op>","v":<val>}` — path persists until changed,
-///   so continuations may omit `p`/`o` and carry only `v`;
-/// - long answers stream under path `response/content`;
-/// - the final `update_session` blob always carries the complete answer in
-///   `v.response.fragments[]` — for short replies (and for the tail of a long
-///   one) it is the *only* place the text appears, so it is authoritative;
-/// - stream ends when `response/status` receives `"FINISHED"`;
-/// - the same blob's `v.response.message_id` is needed for threading the next
-///   turn.
 /// Is this SSE path a response-content path?
 ///
 /// Captured live: `response/content` (older shape) and
@@ -104,6 +89,25 @@ fn is_content_path(path: &str) -> bool {
         .is_some_and(|index| index.parse::<i32>().is_ok())
 }
 
+/// Incremental SSE parser for the DeepSeek web JSON-patch protocol.
+/// Feed raw network chunks; it buffers blank-line-separated events and
+/// accumulates answer content.
+///
+/// Protocol (captured live, see the tests below):
+///
+/// - `data:` lines carry JSON patches;
+/// - `{"p":"<path>","o":"<op>","v":<val>}` — the path persists until the next
+///   `p`, so continuations may omit `p`/`o` and carry only `v`;
+/// - the answer streams as `APPEND` under the content paths
+///   `response/content` and `response/fragments/<index>/content` (the index may
+///   be negative: `-1` is the first response fragment). One answer can span
+///   both: captured live, "Кон" arrived under `response/content` and the rest
+///   under `response/fragments/-1/content`;
+/// - `update_session` opens the turn with a full-state blob whose
+///   `v.response.message_id` is needed for threading the next turn. Its
+///   `fragments[]` content is a *partial snapshot* (captured live: "Кон" of a
+///   150-word answer), so it is a fallback used only when nothing streamed;
+/// - the stream ends when `response/status` receives `"FINISHED"`.
 #[derive(Default)]
 pub(crate) struct SseAccumulator {
     buf: Vec<u8>,
@@ -190,23 +194,21 @@ impl SseAccumulator {
             }
         }
 
-        match self.current_path.as_deref().map(is_content_path) {
-            Some(true) => {
+        match self.current_path.as_deref() {
+            Some(path) if is_content_path(path) => {
                 if let Some(s) = v.get("v").and_then(Value::as_str) {
-                    match v.get("o").and_then(Value::as_str) {
-                        Some("SET") => self.text.clear(),
-                        _ => {} // APPEND or omitted
+                    // `SET` restarts the answer, APPEND (or no op) extends it.
+                    if v.get("o").and_then(Value::as_str) == Some("SET") {
+                        self.text.clear();
                     }
                     if !s.is_empty() {
                         self.text.push_str(s);
                     }
                 }
             }
-            Some(false) if self.current_path.as_deref() == Some("response/status") => {
-                if v.get("v").and_then(Value::as_str) == Some("FINISHED") {
-                    debug!("SSE: stream finished");
-                    self.finished = true;
-                }
+            Some("response/status") if v.get("v").and_then(Value::as_str) == Some("FINISHED") => {
+                debug!("SSE: stream finished");
+                self.finished = true;
             }
             _ => {} // token usage, thinking, unknown paths
         }

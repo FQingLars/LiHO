@@ -1,0 +1,71 @@
+name: CI
+
+# Build and test on both desktop targets, and ship the binaries as artifacts.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (x86_64-unknown-linux-gnu)
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: LIhO
+          - name: Windows (x86_64-pc-windows-msvc)
+            # windows-gnu has no prebuilt ONNX Runtime, msvc does.
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: LIhO.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux runtime dependencies
+        if: runner.os == 'Linux'
+        # ALSA headers for cpal's default Linux backend.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Fails here rather than after the long release build if the model
+      # download or a code change breaks something.
+      - name: Build (debug)
+        run: cargo build --locked --target ${{ matrix.target }}
+
+      - name: Test
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
+
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Build (release)
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LIhO-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
