@@ -1,5 +1,7 @@
 # LIhO
 
+[![CI](https://github.com/FQingLars/LiHO/actions/workflows/ci.yml/badge.svg)](https://github.com/FQingLars/LiHO/actions/workflows/ci.yml)
+
 Real-time interview assistant: streaming Russian speech recognition on a
 microphone, an LLM answer while the interviewer is still talking, and the
 answer on screen.
@@ -52,13 +54,28 @@ warning and keeps running on the microphone alone.
 Rust 1.88+ (edition 2024). The ONNX Runtime binaries are downloaded by the
 `ort` crate on first build.
 
-```bash
-# Linux
-cargo build --release
+System packages:
 
-# Windows (MSVC toolchain; ONNX Runtime has no prebuilt windows-gnu)
+| platform | packages |
+|---|---|
+| Debian/Ubuntu | `libasound2-dev` (microphone), `libpipewire-0.3-dev` (loopback), `libwayland-dev libxkbcommon-dev` (overlay) |
+| Windows | nothing — WASAPI is in the OS; build with the MSVC toolchain (ONNX Runtime has no `windows-gnu` prebuild) |
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libwayland-dev libxkbcommon-dev
 cargo build --release
 ```
+
+```powershell
+# Windows (MSVC)
+cargo build --release
+```
+
+CI (`.github/workflows/ci.yml`) runs on every push to `main`: debug build,
+tests, `clippy -D warnings`, formatting check and a release build for
+`x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`, with the binaries
+uploaded as artifacts.
 
 ## Run
 

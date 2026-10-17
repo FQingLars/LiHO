@@ -17,6 +17,7 @@
 - `cargo test` — unit tests
 - `cargo test live -- --ignored --nocapture` — live round-trip: real model, real microphone, real DeepSeek chat
 - `cargo check --target x86_64-pc-windows-msvc` — cross-compile check (windows-gnu has no ONNX Runtime prebuilds)
+- CI: `.github/workflows/ci.yml`, matrix ubuntu-latest + windows-latest, steps = debug build, tests, `clippy -D warnings`, `fmt --check`, release build, artifact upload. Linux needs `libasound2-dev libpipewire-0.3-dev libwayland-dev libxkbcommon-dev` (pkg-config). The runner's clippy is **newer than the local toolchain** (1.99 vs 1.97), so `clippy -D warnings` can flag lints locally unknown — run the same clippy for both targets before pushing.
 - `python3 scripts/reference_parity.py` — regenerates the upstream splitter oracle numbers (needs numpy)
 
 ## Architecture (src/)
