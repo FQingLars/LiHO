@@ -22,7 +22,16 @@ pub struct OverlayCtl {
 }
 
 impl OverlayCtl {
-    pub fn set_text(&self, text: &str) {
+    pub fn set_status(&self, text: &str) {
+        self.print(text);
+    }
+
+    pub fn push_answer(&self, text: &str) {
+        self.print(text);
+    }
+
+    /// Stdout has no place to replace text — every entry just prints once.
+    fn print(&self, text: &str) {
         if !self.ready.load(Ordering::SeqCst) {
             return;
         }
@@ -76,9 +85,10 @@ mod tests {
     }
 
     #[test]
-    fn set_text_is_always_safe() {
+    fn printing_is_always_safe() {
         let o = handle();
-        o.ctl().set_text("привет");
+        o.ctl().set_status("думаю");
+        o.ctl().push_answer("привет");
     }
 
     #[test]
@@ -86,7 +96,7 @@ mod tests {
         let o = handle();
         let a = o.ctl().clone();
         let b = a.clone();
-        a.set_text("печатается");
+        a.push_answer("печатается");
         assert!(b.ready.load(Ordering::SeqCst));
     }
 }

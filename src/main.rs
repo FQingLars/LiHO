@@ -48,7 +48,7 @@ async fn run() -> Result<(), String> {
     );
     let overlay = display::OverlayHandle::launch(geom)?;
     let overlay_ctl = overlay.ctl().clone();
-    overlay_ctl.set_text("LIhO запускается…");
+    overlay_ctl.set_status("LIhO запускается…");
     for _ in 0..40 {
         if overlay.configured.load(Ordering::SeqCst) {
             info!("display ready");
@@ -78,7 +78,7 @@ async fn run() -> Result<(), String> {
             }
         }
     }
-    overlay_ctl.set_text("Модели загружены");
+    overlay_ctl.set_status("Модели загружены");
 
     // 4. LLM: persistent single-chat session
     let llm = Arc::new(llm::DeepSeekWeb::new(cfg.deepseek_token.clone())?);
@@ -86,7 +86,7 @@ async fn run() -> Result<(), String> {
     info!("Chat session ready: {session_id} (fast mode: thinking disabled)");
     // Warm the PoW pool now so the first question gets an instant header.
     llm.schedule_refill();
-    overlay_ctl.set_text("LIhO готов — слушаю вопросы");
+    overlay_ctl.set_status("LIhO готов — слушаю вопросы");
 
     // 5. Ctrl-C (Windows/Linux) and SIGTERM stop the app.
     let stop = Arc::new(AtomicBool::new(false));

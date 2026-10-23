@@ -6,7 +6,7 @@
 //! translucent background, no keyboard grab, **empty input region** so
 //! mouse clicks pass through to whatever is underneath.
 //! The Wayland connection lives on a dedicated thread; the owner talks to
-//! it through a calloop channel (`set_text` / Drop=stop).
+//! it through a calloop channel (`set_status` / `push_answer` / Drop=stop).
 //!
 //! Note: like any visible pixels, the overlay is part of the composited
 //! output — a full-screen capture sees it. It does NOT appear in window
@@ -46,22 +46,37 @@ use super::{MARGIN, OVERLAY_H, OVERLAY_W, OverlayGeometry};
 
 /// Inner padding of the rendered panel.
 const PAD: f32 = 12.0;
+/// Vertical gap around the separator rules between stacked entries.
+const BLOCK_GAP: f32 = 8.0;
+/// Separator rule thickness between answer blocks.
+const RULE: f32 = 1.0;
+/// History bound — rendering drops what does not fit anyway.
+const MAX_BLOCKS: usize = 20;
 
 pub(crate) enum Cmd {
-    SetText(String),
+    /// Replace the transient status line on top of the stack.
+    Status(String),
+    /// A finished answer: newest block on top, older ones shift down.
+    Answer(String),
     Stop,
 }
 
 /// Clonable control endpoint — many owners can drive one overlay
-/// (pipeline sets text, signal thread toggles visibility).
+/// (pipeline pushes answers, main sets status, signal thread stops it).
 #[derive(Clone)]
 pub struct OverlayCtl {
     tx: calloop::channel::Sender<Cmd>,
 }
 
 impl OverlayCtl {
-    pub fn set_text(&self, text: &str) {
-        if self.tx.send(Cmd::SetText(text.to_string())).is_err() {
+    pub fn set_status(&self, text: &str) {
+        if self.tx.send(Cmd::Status(text.to_string())).is_err() {
+            debug!("overlay already closed");
+        }
+    }
+
+    pub fn push_answer(&self, text: &str) {
+        if self.tx.send(Cmd::Answer(text.to_string())).is_err() {
             debug!("overlay already closed");
         }
     }
@@ -132,7 +147,10 @@ struct AppState {
     pool: SlotPool,
     width: u32,
     height: u32,
-    text: String,
+    /// Transient line above the stack ("Думаю над ответом…").
+    status: String,
+    /// Answer blocks, newest first.
+    blocks: Vec<String>,
     visible: bool,
     dirty: bool,
     hide_at: Option<std::time::Instant>,
@@ -188,7 +206,8 @@ fn run_overlay(
         pool,
         width: geom.width,
         height: geom.height,
-        text: String::new(),
+        status: String::new(),
+        blocks: Vec::new(),
         visible: false,
         dirty: false,
         hide_at: None,
@@ -248,7 +267,7 @@ fn run_overlay(
             draw_frame(&mut state);
         } else {
             // Hidden: nothing to render; surface stays unmapped until the
-            // next SetText triggers a map-request commit.
+            // next Status/Answer triggers a map-request commit.
             state.dirty = false;
             continue;
         }
@@ -263,18 +282,32 @@ fn run_overlay(
 fn apply_cmd(cmd: Cmd, app: &mut AppState) {
     match cmd {
         Cmd::Stop => app.exit = true,
-        Cmd::SetText(t) => {
-            if app.text != t || !app.visible {
-                app.text = t;
+        Cmd::Status(t) => {
+            if app.status != t || !app.visible {
+                app.status = t;
                 app.visible = true;
-                // Re-arm the auto-hide timer on every fresh answer.
-                app.hide_at = app
-                    .autohide_ms
-                    .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+                arm_autohide(app);
                 app.dirty = true;
             }
         }
+        Cmd::Answer(t) => {
+            // New answer goes on top; the status line it was announced by
+            // has served its purpose.
+            app.status.clear();
+            app.blocks.insert(0, t);
+            app.blocks.truncate(MAX_BLOCKS);
+            app.visible = true;
+            arm_autohide(app);
+            app.dirty = true;
+        }
     }
+}
+
+/// Re-arm the auto-hide timer on every fresh content.
+fn arm_autohide(app: &mut AppState) {
+    app.hide_at = app
+        .autohide_ms
+        .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
 }
 
 /// SlotPool grows by one buffer per redraw; redraws happen only on
@@ -286,7 +319,8 @@ fn draw_frame(app: &mut AppState) {
         w,
         h,
         app.font_size,
-        &app.text,
+        &app.status,
+        &app.blocks,
         &mut app.font_system,
         &mut app.swash,
     );
@@ -304,8 +338,9 @@ fn draw_frame(app: &mut AppState) {
     if buffer.attach_to(surface).is_ok() {
         app.layer.commit();
         debug!(
-            "overlay frame committed ({} chars)",
-            app.text.chars().count()
+            "overlay frame committed ({} block(s), {} status chars)",
+            app.blocks.len(),
+            app.status.chars().count()
         );
     }
 }
@@ -318,13 +353,18 @@ fn unmap(layer: &LayerSurface) {
     layer.commit();
 }
 
-/// Render panel (background + wrapped text) into premultiplied ARGB8888.
+/// Render panel (background + stacked text) into premultiplied ARGB8888.
 /// Pure function of its inputs — unit-testable headless.
+///
+/// Layout: the transient status line on top, then answer blocks newest
+/// first, separated by thin rules. Blocks that do not fit the panel are
+/// dropped whole; the newest one is only clipped.
 pub(crate) fn render_panel(
     w: u32,
     h: u32,
     font_size: f32,
-    text: &str,
+    status: &str,
+    blocks: &[String],
     font_system: &mut FontSystem,
     swash: &mut SwashCache,
 ) -> Vec<u8> {
@@ -366,31 +406,131 @@ pub(crate) fn render_panel(
         None,
     );
 
-    if !text.trim().is_empty() {
-        let line_height = font_size * 1.3;
-        let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
-        buffer.set_size(Some(w as f32 - PAD * 2.0), Some(h as f32 - PAD * 2.0));
-        buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
-        buffer.shape_until_scroll(font_system, true);
+    let max_w = w as f32 - PAD * 2.0;
+    let mut y = PAD;
 
-        let white = Color::rgb(235, 235, 240);
-        let pw = pixmap.width() as i32;
-        let ph = pixmap.height() as i32;
-        buffer.draw(font_system, swash, white, |x, y, gw, gh, color| {
-            for yy in 0..gh as i32 {
-                for xx in 0..gw as i32 {
-                    let px = x + xx;
-                    let py = y + yy;
-                    if px < 0 || py < 0 || px >= pw || py >= ph {
-                        continue;
-                    }
-                    blend_over(pixmap.data_mut(), pw, px, py, color);
-                }
-            }
-        });
+    if !status.trim().is_empty() {
+        let bh = text_height(status, max_w, font_size, font_system);
+        draw_text(&mut pixmap, font_system, swash, status, y, font_size);
+        y += bh + BLOCK_GAP;
+    }
+
+    for (i, (text, bh)) in fitting_blocks(blocks, max_w, h as f32 - PAD - y, font_size, font_system)
+        .iter()
+        .enumerate()
+    {
+        if i > 0 {
+            y += BLOCK_GAP;
+            draw_rule(&mut pixmap, y);
+            y += RULE + BLOCK_GAP;
+        }
+        draw_text(&mut pixmap, font_system, swash, text, y, font_size);
+        y += bh;
     }
 
     pixmap.data().to_vec()
+}
+
+/// Height `text` occupies when wrapped at `width` (0 for empty text).
+fn text_height(text: &str, width: f32, font_size: f32, font_system: &mut FontSystem) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let line_height = font_size * 1.3;
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
+    buffer.set_size(Some(width), None);
+    buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
+    buffer.shape_until_scroll(font_system, true);
+    buffer.layout_runs().count().max(1) as f32 * line_height
+}
+
+/// Which leading blocks fit in `avail` px of stack height, newest first.
+/// Whole blocks only — the cut is at a block boundary — and the first block
+/// is always kept (it is clipped instead of dropped).
+fn fitting_blocks<'a>(
+    blocks: &'a [String],
+    width: f32,
+    avail: f32,
+    font_size: f32,
+    font_system: &mut FontSystem,
+) -> Vec<(&'a str, f32)> {
+    let mut out: Vec<(&str, f32)> = Vec::new();
+    let mut used = 0.0;
+    for b in blocks {
+        let bh = text_height(b, width, font_size, font_system);
+        let extra = if out.is_empty() {
+            0.0
+        } else {
+            BLOCK_GAP * 2.0 + RULE
+        };
+        if !out.is_empty() && used + extra + bh > avail {
+            break;
+        }
+        used += extra + bh;
+        out.push((b.as_str(), bh));
+    }
+    out
+}
+
+/// Draw one text block at the left padding, top edge `y`, clipped to the
+/// panel's inner width and the space below `y`.
+fn draw_text(
+    pixmap: &mut Pixmap,
+    font_system: &mut FontSystem,
+    swash: &mut SwashCache,
+    text: &str,
+    y: f32,
+    font_size: f32,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let line_height = font_size * 1.3;
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
+    buffer.set_size(
+        Some(pixmap.width() as f32 - PAD * 2.0),
+        Some(pixmap.height() as f32 - PAD - y),
+    );
+    buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
+    buffer.shape_until_scroll(font_system, true);
+
+    let white = Color::rgb(235, 235, 240);
+    let pw = pixmap.width() as i32;
+    let ph = pixmap.height() as i32;
+    let (ox, oy) = (PAD as i32, y as i32);
+    buffer.draw(font_system, swash, white, |gx, gy, gw, gh, color| {
+        for yy in 0..gh as i32 {
+            for xx in 0..gw as i32 {
+                let px = ox + gx + xx;
+                let py = oy + gy + yy;
+                if px < 0 || py < 0 || px >= pw || py >= ph {
+                    continue;
+                }
+                blend_over(pixmap.data_mut(), pw, px, py, color);
+            }
+        }
+    });
+}
+
+/// Thin separator rule between stacked answers.
+fn draw_rule(pixmap: &mut Pixmap, y: f32) {
+    let mut pb = PathBuilder::new();
+    pb.push_rect(
+        tiny_skia::Rect::from_xywh(PAD, y, pixmap.width() as f32 - PAD * 2.0, RULE).expect("rect"),
+    );
+    let path = pb.finish().expect("path");
+    let paint = Paint {
+        shader: tiny_skia::Shader::SolidColor(tiny_skia::Color::from_rgba8(255, 255, 255, 40)),
+        anti_alias: true,
+        ..Default::default()
+    };
+    pixmap.fill_path(
+        &path,
+        &paint,
+        tiny_skia::FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 }
 
 /// Premultiplied source-over: out = src_pm + dst_pm * (1 - src_a).
@@ -464,7 +604,7 @@ impl LayerShellHandler for AppState {
         self.height = configure.new_size.1.max(1);
         self.configured_done = true;
         if !self.configured_flag.swap(true, Ordering::SeqCst) {
-            self.text = "LIhO готов".to_string();
+            self.status = "LIhO готов".to_string();
             self.visible = true;
             self.dirty = true;
         }
@@ -520,9 +660,14 @@ mod tests {
     use super::*;
 
     fn render(text: &str) -> Vec<u8> {
+        stack("", &[text.to_string()])
+    }
+
+    /// Panel with one transient status line and a stack of answer blocks.
+    fn stack(status: &str, blocks: &[String]) -> Vec<u8> {
         let mut fs = FontSystem::new();
         let mut sw = SwashCache::new();
-        render_panel(OVERLAY_W, OVERLAY_H, 16.0, text, &mut fs, &mut sw)
+        render_panel(OVERLAY_W, OVERLAY_H, 16.0, status, blocks, &mut fs, &mut sw)
     }
 
     fn bright_pixel_count(rgba: &[u8]) -> usize {
@@ -570,6 +715,84 @@ mod tests {
     }
 
     #[test]
+    fn text_height_counts_wrapped_lines() {
+        let mut fs = FontSystem::new();
+        let one = text_height("одна строка", 400.0, 16.0, &mut fs);
+        let two = text_height("две\nстроки", 400.0, 16.0, &mut fs);
+        let wrapped = text_height(&"очень длинная строка ".repeat(8), 120.0, 16.0, &mut fs);
+        assert!(one > 0.0);
+        assert!((two - one * 2.0).abs() < 0.5, "{one} vs {two}");
+        assert!(wrapped > two * 2.0, "narrow width must wrap: {wrapped}");
+        assert_eq!(text_height("", 400.0, 16.0, &mut fs), 0.0);
+    }
+
+    #[test]
+    fn stack_keeps_only_the_newest_blocks_that_fit() {
+        let mut fs = FontSystem::new();
+        let blocks: Vec<String> = ["новый", "средний", "старый"].map(String::from).to_vec();
+        let line = 16.0 * 1.3;
+        // Generous room for two one-line blocks, never three.
+        let shown = fitting_blocks(&blocks, 400.0, line * 2.0 + 30.0, 16.0, &mut fs);
+        let texts: Vec<&str> = shown.iter().map(|(t, _)| *t).collect();
+        assert_eq!(texts, ["новый", "средний"], "the oldest drops off");
+    }
+
+    #[test]
+    fn stack_stops_at_the_first_block_that_does_not_fit() {
+        let mut fs = FontSystem::new();
+        let blocks = vec![
+            "короткий".to_string(),
+            "слово ".repeat(60),
+            "хвост".to_string(),
+        ];
+        let line = 16.0 * 1.3;
+        let shown = fitting_blocks(&blocks, 200.0, line * 4.0, 16.0, &mut fs);
+        assert_eq!(shown.len(), 1, "a block must not leave a hole in the stack");
+    }
+
+    #[test]
+    fn first_block_is_kept_even_when_taller_than_the_panel() {
+        let mut fs = FontSystem::new();
+        let blocks = vec!["слово ".repeat(60)];
+        let shown = fitting_blocks(&blocks, 200.0, 16.0 * 1.3, 16.0, &mut fs);
+        assert_eq!(shown.len(), 1, "the newest answer is never dropped");
+    }
+
+    #[test]
+    fn stacked_answers_render_newest_on_top() {
+        let one = stack("", &["новый ответ".to_string()]);
+        let two = stack("", &["новый ответ".to_string(), "старый ответ".to_string()]);
+        let below = |rgba: &Vec<u8>| {
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .skip(45 * OVERLAY_W as usize)
+                .filter(|p| p[2] > 170 && p[3] > 60)
+                .count()
+        };
+        assert_eq!(below(&one), 0, "one block stays on top");
+        assert!(below(&two) > 30, "the older answer must shift below");
+    }
+
+    #[test]
+    fn status_sits_above_the_newest_answer() {
+        let with = stack("Думаю над ответом…", &["ответ".to_string()]);
+        let without = stack("", &["ответ".to_string()]);
+        let above = |rgba: &Vec<u8>| {
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .take(45 * OVERLAY_W as usize)
+                .filter(|p| p[2] > 170 && p[3] > 60)
+                .count()
+        };
+        assert!(
+            above(&with) > above(&without),
+            "the status line must add text on top"
+        );
+    }
+
+    #[test]
     fn rendering_is_deterministic() {
         assert_eq!(render("тест"), render("тест"));
     }
@@ -594,7 +817,7 @@ mod tests {
         );
         overlay
             .ctl()
-            .set_text("Проверка оверлея: вопрос интервью появится здесь");
+            .push_answer("Проверка оверлея: вопрос интервью появится здесь");
         tokio::time::sleep(Duration::from_millis(600)).await;
         drop(overlay); // clean shutdown + join
     }

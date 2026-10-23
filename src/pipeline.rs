@@ -351,7 +351,7 @@ fn listen(
         if gate.allows(heard.saturating_sub(sent_chars), now) {
             gate.record_sent(now);
             sent_chars = heard;
-            overlay.set_text("Формирую ответ…");
+            overlay.set_status("Формирую ответ…");
             inbox.put(state.message());
         }
 
@@ -410,7 +410,7 @@ fn answer_worker(
         let Some(message) = inbox.take_timeout(Duration::from_millis(150)) else {
             continue;
         };
-        overlay.set_text("Думаю над ответом…");
+        overlay.set_status("Думаю над ответом…");
         let started = Instant::now();
         if !llm.has_ready_pow() {
             warn!("PoW pool cold — this answer may wait for a solve");
@@ -422,7 +422,7 @@ fn answer_worker(
         match result {
             Ok((answer, mid)) => {
                 parent_msg = mid;
-                overlay.set_text(&answer);
+                overlay.push_answer(&answer);
                 info!(
                     "LLM answered in {:.1} s ({} chars)",
                     started.elapsed().as_secs_f32(),
@@ -431,7 +431,7 @@ fn answer_worker(
             }
             Err(e) => {
                 error!("LLM failed: {e}");
-                overlay.set_text(&format!("Ошибка LLM:\n{e}"));
+                overlay.push_answer(&format!("Ошибка LLM:\n{e}"));
             }
         }
     }
