@@ -34,6 +34,7 @@ use ort::value::Tensor;
 
 pub use decoder::greedy_decode;
 pub use splitter::LogprobSplitter;
+use splitter::PHRASE_SILENCE_FRAMES;
 
 use decoder::NUM_LABELS;
 
@@ -140,7 +141,7 @@ impl Transcriber {
         Ok(Self {
             session,
             state: vec![f16::ZERO; STATE_SIZE],
-            splitter: LogprobSplitter::new(),
+            splitter: LogprobSplitter::new().with_min_silence(PHRASE_SILENCE_FRAMES),
         })
     }
 

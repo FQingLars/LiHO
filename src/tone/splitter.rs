@@ -12,6 +12,13 @@
 
 use super::decoder::NUM_LABELS;
 
+/// Consecutive non-speech frames that close a phrase in the app: the
+/// interviewer's pause must reach 0.7 s before the phrase is transcribed.
+/// A frame is 30 ms (T-one emits 10 frames per 300 ms chunk), so 23 frames
+/// = 690 ms is the closest frame count. [`LogprobSplitter::default`] keeps
+/// the upstream 20 frames (600 ms) so `reference_parity` still pins the port.
+pub const PHRASE_SILENCE_FRAMES: usize = 23;
+
 /// One finalized phrase: raw logprobs plus its frame range (for timestamps).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Phrase {
@@ -55,6 +62,13 @@ impl Default for LogprobSplitter {
 impl LogprobSplitter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Splitter with a custom phrase-closing silence
+    /// (see [`PHRASE_SILENCE_FRAMES`]).
+    pub fn with_min_silence(mut self, frames: usize) -> Self {
+        self.min_silence = frames;
+        self
     }
 
     /// Consume one chunk of `[frames * NUM_LABELS]` logprobs.
@@ -281,6 +295,46 @@ mod tests {
         let phrases = s.forward(&frames(&pattern), false);
         assert_eq!(phrases.len(), 2, "two closed phrases: {phrases:?}");
         assert!(phrases[1].start_frame > phrases[0].end_frame);
+    }
+
+    #[test]
+    fn app_silence_threshold_does_not_split_a_600ms_pause() {
+        // The app transcribes a phrase only after a 0.7 s pause: a 600 ms
+        // gap (20 frames) must stay inside the same phrase.
+        let mut s = LogprobSplitter::new().with_min_silence(PHRASE_SILENCE_FRAMES);
+        s.forward(&frames(&silence(30)), false);
+        s.forward(&frames(&speech(60)), false);
+
+        let mut gap = silence(20);
+        gap.extend(speech(10));
+        assert!(
+            s.forward(&frames(&gap), false).is_empty(),
+            "600 ms pause must not close the phrase"
+        );
+    }
+
+    #[test]
+    fn app_silence_threshold_closes_a_phrase_after_690ms() {
+        // 23 frames * 30 ms = 690 ms — the closest frame count to 0.7 s.
+        let mut s = LogprobSplitter::new().with_min_silence(PHRASE_SILENCE_FRAMES);
+        s.forward(&frames(&silence(30)), false);
+        s.forward(&frames(&speech(60)), false);
+
+        let mut gap = silence(23);
+        gap.extend(speech(10));
+        assert_eq!(s.forward(&frames(&gap), false).len(), 1);
+    }
+
+    #[test]
+    fn default_silence_threshold_stays_at_upstream_20_frames() {
+        // reference_parity pins the port to upstream MIN_SIL = 20 frames.
+        let mut s = LogprobSplitter::new();
+        s.forward(&frames(&silence(30)), false);
+        s.forward(&frames(&speech(60)), false);
+
+        let mut gap = silence(20);
+        gap.extend(speech(10));
+        assert_eq!(s.forward(&frames(&gap), false).len(), 1);
     }
 
     #[test]
