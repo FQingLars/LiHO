@@ -65,8 +65,11 @@ pub(crate) fn completion_body(
 }
 
 /// Defensive session-id extraction: known paths first, fallback second.
+/// Captured live: `data.biz_data.chat_session.id` (2026-10-23) and the
+/// flatter `data.biz_data.id` / `data.id`.
 pub(crate) fn extract_session_id(v: &Value) -> Option<String> {
-    v.pointer("/data/biz_data/id")
+    v.pointer("/data/biz_data/chat_session/id")
+        .or_else(|| v.pointer("/data/biz_data/id"))
         .or_else(|| v.pointer("/data/id"))
         .and_then(|x| x.as_str())
         .map(String::from)
@@ -601,6 +604,24 @@ mod tests {
     #[test]
     fn extract_session_id_none_when_absent() {
         assert_eq!(extract_session_id(&json!({"error": 1})), None);
+    }
+
+    #[test]
+    fn extract_session_id_from_chat_session_object() {
+        // Captured live 2026-10-23: the create response wraps the session
+        // in data.biz_data.chat_session, not data.biz_data.
+        let v = json!({
+            "code": 0, "msg": "",
+            "data": {"biz_code": 0, "biz_msg": "", "biz_data": {"chat_session": {
+                "id": "bdb7f2c6-5a7a-4b52-8f26-bb4feaa6a089",
+                "title": null, "title_type": "WIP", "pinned": false,
+                "is_empty": true, "agent": "chat"
+            }}}
+        });
+        assert_eq!(
+            extract_session_id(&v).as_deref(),
+            Some("bdb7f2c6-5a7a-4b52-8f26-bb4feaa6a089")
+        );
     }
 
     // ---- SSE fixtures below are byte-for-byte captures from the live API ----
